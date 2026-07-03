@@ -1,0 +1,6 @@
+opencv-python
+numpy
+ffmpeg-python
+pyinstaller
+# Note: tkinter is typically included with standard Python on Windows.
+

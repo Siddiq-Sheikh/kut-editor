@@ -1,0 +1,17 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Persistent Data
+data/
+kut_recent.json
+
+# OS files
+.DS_Store
+Thumbs.db
