@@ -1,0 +1,12 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+## [Version 2.01]
+
+### Added
+- **Drag and Drop Video Import**: Seamlessly drag and drop video files (`.mp4`, `.avi`, `.mov`, `.mkv`, `.webm`, `.ts`) directly from your folders into the Kut editor window. Videos are automatically imported into the left panel's media bin without needing to go through the traditional file dialog.
+- Removed external `windnd` dependency and implemented a robust, native 64-bit safe `ctypes` wrapper to handle Windows file drop events flawlessly without crashing.
+
+### Fixed
+- **Unsaved Changes Prompt**: The "Export before closing?" prompt now properly only appears when actual edits (splits, cuts, etc.) have been made to the video, instead of incorrectly triggering simply when a video is loaded from the media bin.

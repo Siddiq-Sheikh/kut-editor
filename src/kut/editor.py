@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 import queue
 import subprocess
+from .dragdrop import hook_dropfiles
 
 from .config import Theme, resource_path, get_data_dir
 from .ui import UI
@@ -176,6 +177,12 @@ class Kut:
                     
                     # Maximize window
                     ctypes.windll.user32.ShowWindow(hwnd, 3) # SW_MAXIMIZE
+                    
+                    # Add drag and drop support
+                    try:
+                        hook_dropfiles(hwnd, self._on_drop)
+                    except Exception as e:
+                        pass
             except Exception:
                 pass
         # -----------------------------------------------
@@ -571,6 +578,37 @@ class Kut:
         self._sources.append(source)
         self._register_file(p, source)
         self._add_recent_file(p)
+
+    def _on_drop(self, files):
+        if self._is_demo:
+            return
+        
+        for f in files:
+            if isinstance(f, bytes):
+                try:
+                    f = f.decode('gbk')
+                except UnicodeDecodeError:
+                    try:
+                        f = f.decode('utf-8')
+                    except UnicodeDecodeError:
+                        continue
+            
+            if not f: continue
+            
+            if not f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.ts')):
+                continue
+                
+            p = self._ensure_standard_mp4(f)
+            if not p: continue
+            
+            try:
+                source = VideoSource(p)
+                self._sources.append(source)
+                self._register_file(p, source)
+                self._add_recent_file(p)
+            except IOError:
+                pass
+
 
     def _execute_export(self):
         # Guard against double-clicking during active export
@@ -1687,8 +1725,15 @@ class Kut:
                         resize_to = (self.master_w, self.master_h) if (src.width, src.height) != (self.master_w, self.master_h) else None
                         self.clips = [Clip(src, 0, src.frame_count, label=lbl, resize_to=resize_to)]
                         self.current_idx = 0
-                        self._mark_edit(push_undo=True)
+                        self.current_video_path = fdict["path"]
+                        self.is_dirty = False
+                        self._undo_stack.clear(); self._redo_stack.clear()
+                        self._tl_dirty = True
                         self._viewport_idx = None
+                        with self._thumb_cache_lock:
+                            self._thumb_cache.clear()
+                            self._thumb_pending.clear()
+                        self._invalidate_clip_index()
                         return
 
         elif event == cv2.EVENT_LBUTTONDOWN:
