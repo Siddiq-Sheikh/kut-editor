@@ -180,7 +180,7 @@ class Kut:
                     
                     # Add drag and drop support
                     try:
-                        hook_dropfiles(hwnd, self._on_drop)
+                        hook_dropfiles(hwnd, self._on_drop, on_close=self._safe_exit)
                     except Exception as e:
                         pass
             except Exception:
@@ -542,9 +542,17 @@ class Kut:
             initialdir=os.path.expanduser("~"),
             filetypes=[("Video", "*.mp4 *.avi *.mov *.mkv *.wmv"), ("All", "*.*")])
 
+    def _get_base_name(self):
+        if getattr(self, "current_video_path", None):
+            return os.path.splitext(os.path.basename(self.current_video_path))[0]
+        if getattr(self, "clips", []):
+            path = getattr(self.clips[0].source, "path", None)
+            if path:
+                return os.path.splitext(os.path.basename(path))[0]
+        return "Sequence"
+
     def _dialog_save(self):
-        base = os.path.splitext(os.path.basename(
-            self.current_video_path or "Sequence_01"))[0]
+        base = self._get_base_name()
         return filedialog.asksaveasfilename(
             parent=self._root(), title="Export Sequence",
             initialfile=f"{base}_EXPORT.mp4",
@@ -558,7 +566,10 @@ class Kut:
         if not self.is_dirty: return True
         ans = messagebox.askyesnocancel("Unsaved", "Export before closing?", parent=self._root())
         if ans is True: return self._execute_export()
-        return ans is False
+        if ans is False:
+            self.is_dirty = False
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Commands
@@ -679,7 +690,14 @@ class Kut:
                                 self.render(); cv2.waitKey(1)
                 finally:
                     writer.release()
-                self.is_dirty = False; self.status_msg = ""; return True
+                self.is_dirty = False
+                self.status_msg = "Export Completed"
+                self.status_color = (0, 255, 0)
+                def clear_status():
+                    self.status_msg = ""
+                    self.status_color = None
+                threading.Timer(3.0, clear_status).start()
+                return True
                 
             elif choice == "frames":
                 out_dir = filedialog.askdirectory(parent=self._root(), title="Select Output Folder")
@@ -708,13 +726,21 @@ class Kut:
                         frame = c.get_frame(l_idx, high_quality=True, global_blur_strokes=self.global_blur_strokes)
                         if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
                             frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
-                        fname = os.path.join(out_dir, f"frame_{gf:06d}.jpg")
+                        base_name = self._get_base_name()
+                        fname = os.path.join(out_dir, f"{base_name}_{written+1:03d}.jpg")
                         cv2.imwrite(fname, frame)
                     written += 1
                     if written % 10 == 0 or written == len(frames_to_export):
                         self.status_msg = f"Exporting Frames: {written}/{len(frames_to_export)}"
                         self.render(); cv2.waitKey(1)
-                self.status_msg = ""; return True
+                self.is_dirty = False
+                self.status_msg = "Export Completed"
+                self.status_color = (0, 255, 0)
+                def clear_status_frames():
+                    self.status_msg = ""
+                    self.status_color = None
+                threading.Timer(3.0, clear_status_frames).start()
+                return True
         finally:
             self._is_exporting = False
 
@@ -1553,11 +1579,12 @@ class Kut:
             cx += UI.text_w(desc, 0.27) + 14
 
         # Status message (right-aligned, accent)
-        if self.status_msg:
+        if getattr(self, "status_msg", ""):
+            color = getattr(self, "status_color", None) or Theme.ACCENT
             sw  = UI.text_w(self.status_msg, 0.32)
             dot_x = x2 - sw - 26
-            cv2.circle(canvas, (dot_x, mid - 2), 3, Theme.ACCENT, -1)
-            UI.text(canvas, self.status_msg, (dot_x + 10, mid), 0.32, Theme.ACCENT, shadow=False)
+            cv2.circle(canvas, (dot_x, mid - 2), 3, color, -1)
+            UI.text(canvas, self.status_msg, (dot_x + 10, mid), 0.32, color, shadow=False)
 
 
     # ------------------------------------------------------------------

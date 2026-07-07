@@ -42,7 +42,7 @@ _drop_callbacks = {}
 _old_wndprocs = {}
 _hooked_hwnds = set()
 
-def hook_dropfiles(hwnd, callback):
+def hook_dropfiles(hwnd, callback, on_close=None):
     """
     Safely hooks the window procedure to accept file drops (WM_DROPFILES)
     without causing 64-bit access violations.
@@ -54,6 +54,13 @@ def hook_dropfiles(hwnd, callback):
     _old_wndprocs[hwnd] = old_proc
     
     def wndproc(hw, msg, wp, lp):
+        if msg == 0x0010: # WM_CLOSE
+            if on_close is not None:
+                try:
+                    if not on_close():
+                        return 0
+                except Exception as e:
+                    pass
         if msg == WM_DROPFILES:
             count = DragQueryFile(wp, 0xFFFFFFFF, None, 0)
             files = []
