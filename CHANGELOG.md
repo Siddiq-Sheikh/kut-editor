@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Version 2.01]
+## [Version 2.1]
 
 ### Added
 - **Drag and Drop Video Import**: Seamlessly drag and drop video files (`.mp4`, `.avi`, `.mov`, `.mkv`, `.webm`, `.ts`) directly from your folders into the Kut editor window. Videos are automatically imported into the left panel's media bin without needing to go through the traditional file dialog.
