@@ -26,11 +26,22 @@ class UI:
         x1, y1 = p1; x2, y2 = p2
         if x2 <= x1 or y2 <= y1: return
         radius = max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+        
+        # Base fill
         cv2.rectangle(img, (x1 + radius, y1), (x2 - radius, y2), color, -1)
         cv2.rectangle(img, (x1, y1 + radius), (x2, y2 - radius), color, -1)
         for cx, cy in ((x1+radius, y1+radius), (x2-radius, y1+radius),
                        (x1+radius, y2-radius), (x2-radius, y2-radius)):
             cv2.circle(img, (cx, cy), radius, color, -1)
+            
+        # Subtle 3D Top Highlight
+        highlight = tuple(min(255, c + 15) for c in color)
+        cv2.line(img, (x1 + radius, y1), (x2 - radius, y1), highlight, 1)
+        
+        # Subtle 3D Bottom Shadow
+        shadow = tuple(max(0, c - 15) for c in color)
+        cv2.line(img, (x1 + radius, y2), (x2 - radius, y2), shadow, 1)
+
         if border_color:
             cv2.rectangle(img, (x1, y1), (x2, y2), border_color, border_thick)
 

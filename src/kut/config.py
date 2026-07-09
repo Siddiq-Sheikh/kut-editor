@@ -41,38 +41,38 @@ def get_data_dir():
 # THEME
 # ---------------------------------------------------------------------------
 class Theme:
-    BG           = (10,  10,  14)    # near-black canvas
-    PANEL        = (18,  18,  24)    # primary panel
-    PANEL_ALT    = (26,  26,  34)    # slightly lighter panel
-    PANEL_DARK   = (12,  12,  16)    # darker inset
-    PANEL_HOVER  = (34,  34,  44)    # hover state
-    BORDER       = (42,  42,  56)    # subtle border
-    BORDER_HI    = (255, 185, 40)    # gold accent border
-    BORDER_ACT   = (80,  170, 255)   # active / blue
-    TEXT         = (215, 215, 225)   # primary text
-    TEXT_DIM     = (110, 110, 125)   # secondary text
-    TEXT_BRIGHT  = (255, 255, 255)   # bright white
-    ACCENT       = (255, 185, 40)    # warm gold
-    ACCENT_DARK  = (90,  62,  8)     # dark gold fill
-    DANGER       = (230, 65,  65)    # red
-    OK           = (80,  210, 110)   # green
-    RULER_BG     = (8,   8,   12)    # timeline ruler
+    BG           = (8,   8,   11)    # Deeper, richer black canvas
+    PANEL        = (20,  20,  26)    # Primary panel (slightly tinted)
+    PANEL_ALT    = (28,  28,  36)    # Lighter panel 
+    PANEL_DARK   = (14,  14,  18)    # Darker inset
+    PANEL_HOVER  = (40,  40,  50)    # Responsive hover state
+    BORDER       = (45,  45,  60)    # Subtle modern border
+    BORDER_HI    = (255, 195, 60)    # Vibrant gold accent border
+    BORDER_ACT   = (90,  180, 255)   # Vibrant active / blue
+    TEXT         = (225, 225, 235)   # Crisp primary text
+    TEXT_DIM     = (125, 125, 140)   # Clean secondary text
+    TEXT_BRIGHT  = (255, 255, 255)   # Pure white
+    ACCENT       = (255, 195, 60)    # Warm, bright gold
+    ACCENT_DARK  = (100, 70,  10)    # Deep gold fill
+    DANGER       = (240, 75,  75)    # Punchy red
+    OK           = (85,  220, 120)   # Vibrant green
+    RULER_BG     = (10,  10,  14)    # Timeline ruler base
     PLAYHEAD     = (255, 255, 255)
-    GHOST        = (80,  80,  255)
-    SCISSORS     = (30,  30,  255)
-    SHADOW       = (0,   0,   0)     # drop shadows
+    GHOST        = (90,  90,  255)
+    SCISSORS     = (40,  40,  255)
+    SHADOW       = (0,   0,   0)     # Drop shadows
 
     CLIP_PALETTE = [
-        (210, 140,  70),   # warm amber
-        (130,  95, 215),   # indigo
-        ( 70, 185, 115),   # sage green
-        ( 60, 145, 225),   # sky blue
-        (215,  95,  85),   # coral
-        (155, 205,  70),   # lime
-        (205,  85, 165),   # magenta
-        ( 80, 195, 195),   # teal
-        (225, 160,  55),   # gold
-        ( 95, 125, 215),   # periwinkle
+        (220, 150,  75),   # Warm amber
+        (140, 105, 225),   # Indigo
+        ( 80, 195, 125),   # Sage green
+        ( 70, 155, 235),   # Sky blue
+        (225, 105,  95),   # Coral
+        (165, 215,  80),   # Lime
+        (215,  95, 175),   # Magenta
+        ( 90, 205, 205),   # Teal
+        (235, 170,  65),   # Gold
+        (105, 135, 225),   # Periwinkle
     ]
 
 # ---------------------------------------------------------------------------

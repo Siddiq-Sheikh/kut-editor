@@ -149,7 +149,9 @@ class Clip:
             x1, y1 = max(0, min(w, x1)), max(0, min(h, y1))
             x2, y2 = max(0, min(w, x2)), max(0, min(h, y2))
             if y2 > y1 and x2 > x1:
-                frame = frame[y1:y2, x1:x2]
+                masked = np.zeros_like(frame)
+                masked[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
+                frame = masked
         
         if self.resize_to and (frame.shape[1], frame.shape[0]) != self.resize_to:
             mode = cv2.INTER_CUBIC if high_quality else cv2.INTER_NEAREST

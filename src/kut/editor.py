@@ -23,12 +23,14 @@ from .media import VideoSource, Clip, _clip_id_counter, _clip_color_counter
 # ---------------------------------------------------------------------------
 class Kut:
     # ---- layout constants (pixels) ----
-    TOOLBAR_H    = 52          # taller toolbar
+    TOOLBAR_H    = 64          # taller toolbar
     LEFT_W       = 220         # wider media browser for thumbnails
     RIGHT_W      = 210
     TIMELINE_H   = 168
     FOOTER_H     = 26
     THUMB_SIZE   = 64
+    THUMB_W = 114
+    THUMB_H = 64
     THUMB_CACHE_MAX = 5000
 
     def __init__(self, video_path=None):
@@ -49,6 +51,9 @@ class Kut:
 
         self.master_w, self.master_h, self.master_fps = 1920, 1080, 30.0  # default values for UI
         self.current_video_path = None
+        self.project_path = None
+        self._last_auto_save_time = time.time()
+        self._auto_save_interval = 60.0  # 1 minute
         self.is_dirty = False
         self._is_demo = False
 
@@ -98,6 +103,10 @@ class Kut:
         # In-place timecode edit
         self._edit_timecode_mode = False
         self._edit_timecode_str = ""
+        
+        # Track Panel Features
+        self._track_selection_mode = False
+        self._selected_tracks = set()
 
         # Timeline zoom/scroll
         self._tl_zoom   = 1.0   # pixels per frame  (base = canvas_w / total_frames)
@@ -119,9 +128,9 @@ class Kut:
         self._tl_dirty       = True
 
         # Thumbnail caching
-        self._thumb_cache = OrderedDict()          # (source_key, frame_idx) -> numpy array (THUMB_SIZE, THUMB_SIZE, 3)
+        self._thumb_cache = OrderedDict()          # (source_key, frame_idx) -> numpy array (THUMB_H, THUMB_W, 3)
         self._thumb_pending = set()                # set of (source_key, frame_idx) currently being generated
-        self._thumb_queue = queue.Queue(maxsize=1024)
+        self._thumb_queue = queue.LifoQueue(maxsize=1024)
         self._thumb_cache_lock = threading.Lock()
         self._worker_active = True
         self._worker_thread = threading.Thread(target=self._thumbnail_worker, daemon=True)
@@ -149,13 +158,11 @@ class Kut:
         except Exception:
             pass
 
-        cv2.namedWindow(self.win_name, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(self.win_name, cv2.WINDOW_NORMAL | getattr(cv2, "WINDOW_GUI_NORMAL", 0))
         
         # --- WINDOWS ICON & TASKBAR INTEGRATION ---
         if os.name == 'nt':
             try:
-                import time # Ensure time is imported
-                
                 # 1. Force Windows to treat this as an independent app
                 myappid = 'kut.production.engine.9' 
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
@@ -336,10 +343,10 @@ class Kut:
                 try:
                     raw = source.get_frame_for_thumbnail(frame_idx)
                     if raw is not None:
-                        thumb = cv2.resize(raw, (self.THUMB_SIZE, self.THUMB_SIZE),
+                        thumb = cv2.resize(raw, (self.THUMB_W, self.THUMB_H),
                                            interpolation=cv2.INTER_NEAREST)
                     else:
-                        thumb = np.zeros((self.THUMB_SIZE, self.THUMB_SIZE, 3), dtype=np.uint8)
+                        thumb = np.zeros((self.THUMB_H, self.THUMB_W, 3), dtype=np.uint8)
                     key = (self._get_source_key(source), frame_idx)
                     with self._thumb_cache_lock:
                         self._thumb_cache[key] = thumb
@@ -388,7 +395,7 @@ class Kut:
         mm  = int((s % 3600) // 60)
         ss  = int(s % 60)
         ff  = int(round((s - int(s)) * fps)) % max(1, int(round(fps)))
-        return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
+        return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}f"
 
     def _parse_tc(self, s):
         s = s.strip()
@@ -446,17 +453,51 @@ class Kut:
     # ------------------------------------------------------------------
     def _ensure_standard_mp4(self, path):
         try:
+            # Try OpenCV first
+            cap = cv2.VideoCapture(path)
+            ok, _ = cap.read()
+            cap.release()
+            if ok:
+                return path
+
             cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", path]
             codec = subprocess.check_output(cmd, creationflags=subprocess.CREATE_NO_WINDOW).decode().strip()
             if codec in ("hevc", "h265"):
                 out_path = os.path.join(get_data_dir(), "transcoded_" + os.path.basename(path) + ".mp4")
                 if os.path.exists(out_path):
                     return out_path
-                self.status_msg = "Converting H.265 to MP4..."
+                    
+                cmd_dur = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]
+                try:
+                    duration = float(subprocess.check_output(cmd_dur, creationflags=subprocess.CREATE_NO_WINDOW).decode().strip())
+                except:
+                    duration = 0.0
+
+                self.status_msg = "Converting H.265 to MP4... Starting"
                 self.render()
                 cv2.waitKey(1)
-                cmd_conv = ["ffmpeg", "-y", "-i", path, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", out_path]
-                subprocess.run(cmd_conv, creationflags=subprocess.CREATE_NO_WINDOW)
+                
+                cmd_conv = ["ffmpeg", "-y", "-i", path, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "aac", "-progress", "-", "-nostats", out_path]
+                process = subprocess.Popen(cmd_conv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                
+                while True:
+                    line = process.stdout.readline()
+                    if not line and process.poll() is not None:
+                        break
+                    if line.startswith("out_time_us="):
+                        try:
+                            us = int(line.split("=")[1].strip())
+                            sec = us / 1000000.0
+                            if duration > 0:
+                                pct = min(100, int((sec / duration) * 100))
+                                self.status_msg = f"Converting H.265... {pct}%"
+                            else:
+                                self.status_msg = f"Converting H.265... {int(sec)}s"
+                            self.render()
+                            cv2.waitKey(1)
+                        except:
+                            pass
+
                 self.status_msg = ""
                 return out_path
         except Exception as e:
@@ -501,7 +542,6 @@ class Kut:
         self._invalidate_clip_index()
         self._register_file(path, source)
         self.zoom_to_fit()
-        self._add_recent_file(path)
 
     def _load_video_file(self, path):
         """Legacy method – calls _open_video_from_path."""
@@ -537,10 +577,15 @@ class Kut:
         return self._tk_root
 
     def _dialog_open(self):
-        return filedialog.askopenfilename(
-            parent=self._root(), title="Open / Import Media",
+        if getattr(self, "_is_dialog_open", False): return ""
+        self._is_dialog_open = True
+        try:
+            return filedialog.askopenfilename(
+                parent=self._root(), title="Open / Import Media",
             initialdir=os.path.expanduser("~"),
             filetypes=[("Video", "*.mp4 *.avi *.mov *.mkv *.wmv"), ("All", "*.*")])
+        finally:
+            self._is_dialog_open = False
 
     def _get_base_name(self):
         if getattr(self, "current_video_path", None):
@@ -553,11 +598,16 @@ class Kut:
 
     def _dialog_save(self):
         base = self._get_base_name()
-        return filedialog.asksaveasfilename(
-            parent=self._root(), title="Export Sequence",
+        if getattr(self, "_is_dialog_open", False): return ""
+        self._is_dialog_open = True
+        try:
+            return filedialog.asksaveasfilename(
+                parent=self._root(), title="Export Sequence",
             initialfile=f"{base}_EXPORT.mp4",
             defaultextension=".mp4",
             filetypes=[("MP4", "*.mp4"), ("AVI", "*.avi")])
+        finally:
+            self._is_dialog_open = False
 
     def _show_error(self, msg):
         messagebox.showerror("Kut", msg, parent=self._root())
@@ -588,7 +638,6 @@ class Kut:
         except IOError: self._show_error(f"Cannot open:\n{p}"); return
         self._sources.append(source)
         self._register_file(p, source)
-        self._add_recent_file(p)
 
     def _on_drop(self, files):
         if self._is_demo:
@@ -616,20 +665,20 @@ class Kut:
                 source = VideoSource(p)
                 self._sources.append(source)
                 self._register_file(p, source)
-                self._add_recent_file(p)
             except IOError:
                 pass
 
 
     def _execute_export(self):
-        # Guard against double-clicking during active export
-        if getattr(self, "_is_exporting", False):
+        if getattr(self, "_is_exporting", False) or getattr(self, "_is_dialog_open", False):
             return False
+        self._is_dialog_open = True
             
         total = self.get_total_frames()
         if total == 0: return False
         
         def ask_radio(title, prompt, options):
+            self._is_dialog_open = True
             import tkinter as tk
             root = self._root()
             top = tk.Toplevel(root)
@@ -662,6 +711,7 @@ class Kut:
             top.focus_force()
             
             root.wait_window(top)
+            self._is_dialog_open = False
             return result[0]
 
         choice = ask_radio("Export", "Select export format:", [("Video (MP4)", "video"), ("Image Sequence (Frames)", "frames")])
@@ -691,7 +741,7 @@ class Kut:
                 finally:
                     writer.release()
                 self.is_dirty = False
-                self.status_msg = "Export Completed"
+                self.status_msg = f"Export Completed: {total} frames"
                 self.status_color = (0, 255, 0)
                 def clear_status():
                     self.status_msg = ""
@@ -709,13 +759,13 @@ class Kut:
                 if mode == "fps":
                     val = simpledialog.askfloat("FPS", "Enter frames per second to extract:", parent=self._root(), initialvalue=1.0)
                     if not val or val <= 0: return False
-                    step = max(1, int(self.master_fps / val))
-                    frames_to_export = list(range(0, total, step))
+                    total_dur = total / (self.master_fps or 25.0)
+                    val = max(1, int(total_dur * val))
+                    frames_to_export = [int(i * (total - 1) / (val - 1)) for i in range(val)] if val > 1 else [0]
                 elif mode == "fixed":
                     val = simpledialog.askinteger("Fixed", "Enter total number of frames to extract:", parent=self._root(), initialvalue=100)
                     if not val or val <= 0: return False
-                    step = max(1, total // val)
-                    frames_to_export = list(range(0, total, step))[:val]
+                    frames_to_export = [int(i * (total - 1) / (val - 1)) for i in range(val)] if val > 1 else [0]
                 else:
                     return False
                     
@@ -734,7 +784,7 @@ class Kut:
                         self.status_msg = f"Exporting Frames: {written}/{len(frames_to_export)}"
                         self.render(); cv2.waitKey(1)
                 self.is_dirty = False
-                self.status_msg = "Export Completed"
+                self.status_msg = f"Export Completed: {len(frames_to_export)} frames"
                 self.status_color = (0, 255, 0)
                 def clear_status_frames():
                     self.status_msg = ""
@@ -743,6 +793,249 @@ class Kut:
                 return True
         finally:
             self._is_exporting = False
+            self._is_dialog_open = False
+
+    def _ask_radio(self, title, prompt, options):
+        self._is_dialog_open = True
+        import tkinter as tk
+        root = self._root()
+        top = tk.Toplevel(root)
+        top.title(title)
+        top.geometry("320x180")
+        top.attributes("-topmost", True)
+        top.resizable(False, False)
+        choice_var = tk.StringVar(value=options[0][1])
+        tk.Label(top, text=prompt, font=("Arial", 10)).pack(pady=10)
+        for text, val in options:
+            tk.Radiobutton(top, text=text, variable=choice_var, value=val, font=("Arial", 10)).pack(anchor="w", padx=50)
+        result = [None]
+        def on_ok():
+            result[0] = choice_var.get()
+            top.destroy()
+        btn_frame = tk.Frame(top)
+        btn_frame.pack(pady=15)
+        tk.Button(btn_frame, text="OK", command=on_ok, width=10).pack(side="left", padx=10)
+        tk.Button(btn_frame, text="Cancel", command=top.destroy, width=10).pack(side="left", padx=10)
+        top.update_idletasks()
+        top.grab_set()
+        top.focus_force()
+        root.wait_window(top)
+        self._is_dialog_open = False
+        return result[0]
+
+    def _execute_export_single(self, clip):
+        if getattr(self, "_is_exporting", False) or getattr(self, "_is_dialog_open", False): return False
+        self._is_dialog_open = True
+        choice = self._ask_radio("Export Single Track", "Select export format:", [("Video (MP4)", "video"), ("Image Sequence (Frames)", "frames")])
+        if not choice: return False
+        
+        self._is_exporting = True
+        try:
+            if choice == "video":
+                target = self._dialog_save()
+                if not target: return False
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(target, fourcc, self.master_fps, (self.master_w, self.master_h))
+                if not writer.isOpened():
+                    self._show_error("Could not create output file."); return False
+                try:
+                    for li in range(len(clip)):
+                        frame = clip.get_frame(li, high_quality=True, global_blur_strokes=self.global_blur_strokes)
+                        if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
+                            frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
+                        writer.write(frame)
+                        if li % 20 == 0 or li == len(clip)-1:
+                            self.status_msg = f"Exporting: {li+1}/{len(clip)}"
+                            self.render(); cv2.waitKey(1)
+                finally:
+                    writer.release()
+                self._show_temp_status(f"Export Completed: {len(clip)} frames", (0, 255, 0))
+                return True
+            elif choice == "frames":
+                out_dir = filedialog.askdirectory(parent=self._root(), title="Select Output Folder")
+                if not out_dir: return False
+                mode = self._ask_radio("Frames Export", "Select frame extraction mode:", [("Frames Per Second (FPS)", "fps"), ("Fixed Number of Frames", "fixed")])
+                if not mode: return False
+                
+                total = len(clip)
+                if mode == "fps":
+                    val = simpledialog.askfloat("FPS", "Enter frames per second to extract:", parent=self._root(), initialvalue=1.0)
+                    if not val or val <= 0: return False
+                    total_dur = total / (self.master_fps or 25.0)
+                    val = max(1, int(total_dur * val))
+                    frames_to_export = [int(i * (total - 1) / (val - 1)) for i in range(val)] if val > 1 else [0]
+                elif mode == "fixed":
+                    val = simpledialog.askinteger("Fixed", "Enter total number of frames to extract:", parent=self._root(), initialvalue=100)
+                    if not val or val <= 0: return False
+                    frames_to_export = [int(i * (total - 1) / (val - 1)) for i in range(val)] if val > 1 else [0]
+                
+                for i, li in enumerate(frames_to_export):
+                    frame = clip.get_frame(li, high_quality=True, global_blur_strokes=self.global_blur_strokes)
+                    if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
+                        frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
+                    base_name = "".join([c if c.isalnum() else "_" for c in clip.label])
+                    fname = os.path.join(out_dir, f"{base_name}_{i+1:03d}.jpg")
+                    cv2.imwrite(fname, frame)
+                    if i % 10 == 0 or i == len(frames_to_export)-1:
+                        self.status_msg = f"Exporting Frames: {i+1}/{len(frames_to_export)}"
+                        self.render(); cv2.waitKey(1)
+                self._show_temp_status(f"Export Completed: {len(frames_to_export)} frames", (0, 255, 0))
+                return True
+        finally:
+            self._is_exporting = False
+            self._is_dialog_open = False
+
+    def _execute_batch_export(self):
+        if getattr(self, "_is_exporting", False) or getattr(self, "_is_dialog_open", False): return False
+        self._is_dialog_open = True
+        clips = [self.clips[i] for i in sorted(self._selected_tracks)]
+        if not clips: return False
+        
+        out_dir = filedialog.askdirectory(parent=self._root(), title="Select Output Folder for Selected Tracks")
+        if not out_dir: return False
+        choice = self._ask_radio("Export Format", "Select format for tracks:", [("Video (MP4)", "video"), ("Image Sequence (Frames)", "frames")])
+        if not choice: return False
+        
+        mode, val = None, None
+        if choice == "frames":
+            mode = self._ask_radio("Frames Export", "Extraction mode:", [("FPS", "fps"), ("Fixed Number", "fixed")])
+            if not mode: return False
+            if mode == "fps":
+                val = simpledialog.askfloat("FPS", "Enter frames per second:", parent=self._root(), initialvalue=1.0)
+            else:
+                val = simpledialog.askinteger("Fixed", "Total frames per track:", parent=self._root(), initialvalue=100)
+            if not val or val <= 0: return False
+
+        self._is_exporting = True
+        total_exported_frames = 0
+        try:
+            for c_idx, clip in enumerate(clips):
+                base_name = "".join([c if c.isalnum() else "_" for c in clip.label])
+                if choice == "video":
+                    target = os.path.join(out_dir, f"{base_name}_{c_idx+1}.mp4")
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    writer = cv2.VideoWriter(target, fourcc, self.master_fps, (self.master_w, self.master_h))
+                    if writer.isOpened():
+                        for li in range(len(clip)):
+                            frame = clip.get_frame(li, high_quality=True, global_blur_strokes=self.global_blur_strokes)
+                            if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
+                                frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
+                            writer.write(frame)
+                            if li % 20 == 0 or li == len(clip)-1:
+                                self.status_msg = f"Exporting {c_idx+1}/{len(clips)}: {li+1}/{len(clip)}"
+                                self.render(); cv2.waitKey(1)
+                        writer.release()
+                        total_exported_frames += len(clip)
+                elif choice == "frames":
+                    total = len(clip)
+                    if mode == "fps":
+                        total_dur = total / (self.master_fps or 25.0)
+                        batch_val = max(1, int(total_dur * val))
+                        frames_to_export = [int(i * (total - 1) / (batch_val - 1)) for i in range(batch_val)] if batch_val > 1 else [0]
+                    else:
+                        frames_to_export = [int(i * (total - 1) / (val - 1)) for i in range(val)] if val > 1 else [0]
+                    
+                    clip_dir = os.path.join(out_dir, f"{base_name}_{c_idx+1}")
+                    os.makedirs(clip_dir, exist_ok=True)
+                    for i, li in enumerate(frames_to_export):
+                        frame = clip.get_frame(li, high_quality=True, global_blur_strokes=self.global_blur_strokes)
+                        if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
+                            frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
+                        fname = os.path.join(clip_dir, f"frame_{i+1:03d}.jpg")
+                        cv2.imwrite(fname, frame)
+                        if i % 10 == 0 or i == len(frames_to_export)-1:
+                            self.status_msg = f"Exporting {c_idx+1}/{len(clips)}: {i+1}/{len(frames_to_export)}"
+                            self.render(); cv2.waitKey(1)
+                    total_exported_frames += len(frames_to_export)
+            self._show_temp_status(f"Batch Export Completed: {total_exported_frames} frames", (0, 255, 0))
+            return True
+        finally:
+            self._is_exporting = False
+            self._is_dialog_open = False
+
+    def _execute_join_tracks(self):
+        if getattr(self, "_is_exporting", False): return False
+        indices = sorted(self._selected_tracks)
+        if len(indices) < 2:
+            self._show_error("Select at least 2 tracks to join.")
+            return False
+        
+        target = self._dialog_save()
+        if not target: return False
+        
+        self._is_exporting = True
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(target, fourcc, self.master_fps, (self.master_w, self.master_h))
+            if not writer.isOpened():
+                self._show_error("Could not create output file."); return False
+            
+            try:
+                for c_idx, i in enumerate(indices):
+                    clip = self.clips[i]
+                    for li in range(len(clip)):
+                        frame = clip.get_frame(li, high_quality=True, global_blur_strokes=self.global_blur_strokes)
+                        if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
+                            frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
+                        writer.write(frame)
+                        if li % 20 == 0 or li == len(clip)-1:
+                            self.status_msg = f"Joining clip {c_idx+1}/{len(indices)}: {li+1}/{len(clip)}"
+                            self.render(); cv2.waitKey(1)
+            finally:
+                writer.release()
+            
+            self._show_temp_status("Join Completed. Re-importing...", (0, 255, 0))
+            
+            from .media import VideoSource, Clip
+            try:
+                new_src = VideoSource(target)
+                new_clip = Clip(new_src, 0, new_src.frame_count, label="Joined Track", resize_to=(self.master_w, self.master_h))
+                self._save_state()
+                for i in reversed(indices):
+                    self.clips.pop(i)
+                insert_idx = indices[0]
+                self.clips.insert(insert_idx, new_clip)
+                self._mark_edit(push_undo=False)
+                self._selected_tracks.clear()
+                self._tl_dirty = True
+                self.current_idx = self._clip_offsets[insert_idx]
+            except Exception as e:
+                self._show_error(f"Error importing joined file: {e}")
+                
+            return True
+        finally:
+            self._is_exporting = False
+            self._is_dialog_open = False
+
+    def _show_temp_status(self, msg, color, duration=3.0):
+        self.status_msg = msg
+        self.status_color = color
+        def clear():
+            if self.status_msg == msg:
+                self.status_msg = ""
+                self.status_color = None
+                self.render()
+        threading.Timer(duration, clear).start()
+
+    def _delete_clip_at(self, idx):
+        if 0 <= idx < len(self.clips):
+            self.get_total_frames()
+            c_start = self._clip_offsets[idx]
+            c_len = len(self.clips[idx])
+            c_end = c_start + c_len
+            
+            clip = self.clips.pop(idx)
+            
+            if self.current_idx >= c_end:
+                self.current_idx -= c_len
+            elif self.current_idx >= c_start:
+                self.current_idx = c_start
+            
+            if getattr(self, "_track_selection_mode", False) and idx in getattr(self, "_selected_tracks", set()):
+                self._selected_tracks.remove(idx)
+                
+            return clip
+        return None
 
     def _execute_goto(self):
         total = self.get_total_frames()
@@ -899,6 +1192,17 @@ class Kut:
 
         # Section header
         y_cursor = UI.section_header(canvas, x1, y1, x2, "SEQUENCE")
+        
+        # Multiselect mode toggle
+        ms_btn_w = 20
+        ms_btn_x = x2 - ms_btn_w - 5
+        ms_btn_y = y1 + 5
+        self._ms_toggle_rect = (ms_btn_x, ms_btn_y, ms_btn_x + ms_btn_w, ms_btn_y + 16)
+        btn_col = Theme.TEXT if getattr(self, "_track_selection_mode", False) else Theme.TEXT_DIM
+        UI.rounded_rect(canvas, (ms_btn_x, ms_btn_y), (ms_btn_x + 14, ms_btn_y + 14), Theme.PANEL_DARK, radius=2, border_color=btn_col)
+        if getattr(self, "_track_selection_mode", False):
+            cv2.line(canvas, (ms_btn_x + 3, ms_btn_y + 7), (ms_btn_x + 6, ms_btn_y + 10), Theme.TEXT_BRIGHT, 1)
+            cv2.line(canvas, (ms_btn_x + 6, ms_btn_y + 10), (ms_btn_x + 11, ms_btn_y + 4), Theme.TEXT_BRIGHT, 1)
 
         active_idx, _, _ = self.get_clip_at_playhead()
         CARD_H  = 62
@@ -907,19 +1211,20 @@ class Kut:
         self._track_rects = []
 
         for idx, clip in enumerate(self.clips):
-            if y_cursor + CARD_H > y2 - 4:
+            if y_cursor + CARD_H > y2 - 40:
                 break
 
-            is_active = (idx == active_idx)
+            is_active = (idx == active_idx) and not getattr(self, "_track_selection_mode", False)
+            is_selected = idx in getattr(self, "_selected_tracks", set())
             cx1 = x1 + CARD_PAD
             cx2 = x2 - CARD_PAD
             cy1 = y_cursor
             cy2 = y_cursor + CARD_H
 
-            bg     = Theme.PANEL_ALT if is_active else Theme.PANEL
-            border = Theme.BORDER_ACT if is_active else Theme.BORDER
+            bg     = Theme.PANEL_ALT if is_active or is_selected else Theme.PANEL
+            border = Theme.BORDER_ACT if is_active or is_selected else Theme.BORDER
             UI.rounded_rect(canvas, (cx1, cy1), (cx2, cy2), bg, radius=6,
-                            border_color=border, border_thick=2 if is_active else 1)
+                            border_color=border, border_thick=2 if (is_active or is_selected) else 1)
 
             # Color swatch strip
             sw_x1, sw_y1 = cx1 + 4, cy1 + 8
@@ -939,8 +1244,10 @@ class Kut:
 
             # Label (source filename)
             lbl_text = clip.label[:18]
-            col = Theme.TEXT_BRIGHT if is_active else Theme.TEXT
+            col = Theme.TEXT_BRIGHT if (is_active or is_selected) else Theme.TEXT
+            lbl_w = UI.text_w(lbl_text, 0.33)
             UI.text(canvas, lbl_text, (cx1 + 18, cy1 + 22), 0.33, col, shadow=False)
+            lbl_rect = (cx1 + 18, cy1 + 10, cx1 + 18 + lbl_w + 10, cy1 + 28)
 
             # Duration
             fps = self.master_fps or 25.0
@@ -951,19 +1258,67 @@ class Kut:
             dur_str = f"{mm:02d}:{ss:02d}.{ff:02d}  •  {len(clip)}f"
             UI.text(canvas, dur_str, (cx1 + 18, cy1 + 42), 0.28, Theme.TEXT_DIM, shadow=False)
 
+            # ── Export icon button ────────────────────────────────────
+            exp_cx = cx2 - 34
+            exp_cy = cy2 - 14
+            cv2.rectangle(canvas, (exp_cx - 4, exp_cy - 4), (exp_cx + 4, exp_cy + 4), Theme.TEXT_DIM, 1)
+            cv2.arrowedLine(canvas, (exp_cx, exp_cy - 6), (exp_cx, exp_cy), Theme.TEXT_DIM, 1, tipLength=0.4)
+            cv2.line(canvas, (exp_cx - 5, exp_cy + 6), (exp_cx + 5, exp_cy + 6), Theme.TEXT_DIM, 1)
+            
             # ── Trash icon button ────────────────────────────────────
             trash_cx = cx2 - 14
             trash_cy = cy2 - 14
             UI.draw_trash_icon(canvas, trash_cx, trash_cy, size=8, color=Theme.DANGER)
 
+            # Checkbox for multiselect
+            chk_rect = None
+            if getattr(self, "_track_selection_mode", False):
+                chk_x1, chk_y1 = cx1 + 16, cy2 - 20
+                chk_x2, chk_y2 = chk_x1 + 12, chk_y1 + 12
+                UI.rounded_rect(canvas, (chk_x1, chk_y1), (chk_x2, chk_y2), Theme.PANEL_DARK, radius=2, border_color=Theme.BORDER)
+                if is_selected:
+                    cv2.line(canvas, (chk_x1 + 3, chk_y1 + 6), (chk_x1 + 5, chk_y1 + 9), Theme.TEXT_BRIGHT, 1)
+                    cv2.line(canvas, (chk_x1 + 5, chk_y1 + 9), (chk_x1 + 9, chk_y1 + 3), Theme.TEXT_BRIGHT, 1)
+                chk_rect = (chk_x1 - 5, chk_y1 - 5, chk_x2 + 5, chk_y2 + 5)
+
             # Store hit rects
             self._track_rects.append({
                 "idx": idx,
                 "rect": (cx1, cy1, cx2, cy2),
-                "del_rect": (trash_cx - 10, trash_cy - 10, trash_cx + 10, trash_cy + 10)
+                "del_rect": (trash_cx - 10, trash_cy - 10, trash_cx + 10, trash_cy + 10),
+                "exp_rect": (exp_cx - 10, exp_cy - 10, exp_cx + 10, exp_cy + 10),
+                "lbl_rect": lbl_rect,
+                "chk_rect": chk_rect
             })
 
             y_cursor += CARD_H + 4
+
+        # Batch actions
+        self._batch_rects = {}
+        if getattr(self, "_track_selection_mode", False) and len(getattr(self, "_selected_tracks", set())) > 0:
+            by = y2 - 35
+            UI.vline(canvas, x1, by-5, by-5, Theme.BORDER)
+            cv2.line(canvas, (x1, by-5), (x2, by-5), Theme.BORDER, 1)
+            
+            b_w = (panel_w - 20) // 3
+            
+            # Join
+            j_x1, j_x2 = x1 + 5, x1 + 5 + b_w
+            UI.rounded_rect(canvas, (j_x1, by), (j_x2, by+26), Theme.PANEL_ALT, radius=4, border_color=Theme.BORDER)
+            UI.text(canvas, "Join", (j_x1 + b_w//2 - 12, by+17), 0.28, Theme.TEXT_BRIGHT, shadow=False)
+            self._batch_rects["join"] = (j_x1, by, j_x2, by+26)
+            
+            # Export
+            e_x1, e_x2 = j_x2 + 5, j_x2 + 5 + b_w
+            UI.rounded_rect(canvas, (e_x1, by), (e_x2, by+26), Theme.PANEL_ALT, radius=4, border_color=Theme.BORDER)
+            UI.text(canvas, "Export", (e_x1 + b_w//2 - 16, by+17), 0.28, Theme.TEXT_BRIGHT, shadow=False)
+            self._batch_rects["export"] = (e_x1, by, e_x2, by+26)
+            
+            # Delete
+            d_x1, d_x2 = e_x2 + 5, e_x2 + 5 + b_w
+            UI.rounded_rect(canvas, (d_x1, by), (d_x2, by+26), Theme.PANEL_ALT, radius=4, border_color=Theme.DANGER)
+            UI.text(canvas, "Delete", (d_x1 + b_w//2 - 16, by+17), 0.28, Theme.DANGER, shadow=False)
+            self._batch_rects["delete"] = (d_x1, by, d_x2, by+26)
 
         if not self.clips:
             mid_x = x1 + panel_w // 2
@@ -1334,12 +1689,13 @@ class Kut:
 
                 # Thumbnails
                 if thumb_h > 4 and w > 0:
-                    tile_size = max(1, self.THUMB_SIZE)
-                    tiles = max(1, w // tile_size)
-                    tile_w = max(1, w // tiles)
+                    import math
+                    tile_size = max(1, self.THUMB_W)
+                    tiles = math.ceil(w / tile_size)
                     for ti in range(tiles):
-                        tix1 = x1 + ti * tile_w
-                        tix2 = x1 + (ti+1) * tile_w
+                        tix1 = x1 + ti * tile_size
+                        tix2 = min(x1 + (ti+1) * tile_size, x1 + w)
+                        tile_w = tix2 - tix1
                         stx1 = max(0, tix1)
                         stx2 = min(vis_w, tix2)
                         if stx2 <= stx1:
@@ -1431,15 +1787,29 @@ class Kut:
         UI.text(canvas, logo_lbl, (logo_x + 8, logo_y), 0.55, Theme.ACCENT, 2, shadow=True)
 
         # ── Buttons ───────────────────────────────────────────────
-        bh   = 34
-        by0  = mid_y - bh // 2
+        bh   = 30
+        by0  = mid_y - bh // 2 + 6
         by1  = by0 + bh
-        bx   = logo_x + logo_w + 22
+        bx   = logo_x + logo_w + 30
 
-        btn_defs = [("import", "Import", 72), ("export", "Export", 72)]
         self._toolbar_btns = []
 
-        for bid, lbl, bw in btn_defs:
+        # Video Group
+        UI.text(canvas, "VIDEO", (bx, by0 - 5), 0.28, Theme.TEXT_DIM, shadow=False)
+        for bid, lbl, bw in [("import", "Import", 64), ("export", "Export", 64)]:
+            rect = (bx, by0, bx + bw, by1)
+            UI.button(canvas, rect, lbl, hovered=(self._hover_id == bid))
+            self._toolbar_btns.append({"id": bid, "rect": rect})
+            bx += bw + 8
+
+        # Vertical separator
+        bx += 4
+        cv2.line(canvas, (bx + 4, mid_y - 10), (bx + 4, mid_y + 10), Theme.BORDER, 1)
+        bx += 16
+
+        # Project Group
+        UI.text(canvas, "PROJECT", (bx, by0 - 5), 0.28, Theme.TEXT_DIM, shadow=False)
+        for bid, lbl, bw in [("open", "Open", 56), ("save", "Save", 56)]:
             rect = (bx, by0, bx + bw, by1)
             UI.button(canvas, rect, lbl, hovered=(self._hover_id == bid))
             self._toolbar_btns.append({"id": bid, "rect": rect})
@@ -1474,7 +1844,9 @@ class Kut:
         full_tc  = f"{tc_str}  /  {tc_end}"
         zoom_str = f"{self._tl_zoom:.1f}x"
         fps_str  = f"{self.master_w}×{self.master_h}  {self.master_fps:.0f}fps"
-        name     = os.path.basename(self.current_video_path or "") or "Untitled"
+        display_path = getattr(self, "project_path", None) or self.current_video_path or ""
+        name     = os.path.basename(display_path) or "Untitled"
+        if getattr(self, "project_path", None): name = name.replace(".kut", "")
 
         # Build items right-to-left
         cx = x2 - 14
@@ -1767,7 +2139,9 @@ class Kut:
             # Toolbar
             if y < self.layout["toolbar"][3]:
                 bid = self._hit_toolbar(x, y)
-                if bid == "import": self._execute_import()
+                if bid == "open": self._execute_load_project()
+                elif bid == "save": self._execute_save_project(is_auto=False)
+                elif bid == "import": self._execute_import()
                 elif bid == "export": self._execute_export()
                 elif bid == "play":   self.is_playing = not self.is_playing
                 
@@ -1795,6 +2169,12 @@ class Kut:
             if hasattr(self, "_crop_btn_rect"):
                 cx1, cy1, cx2, cy2 = self._crop_btn_rect
                 if cx1 <= x <= cx2 and cy1 <= y <= cy2:
+                    if getattr(self, "_crop_mode", False):
+                        self._save_state()
+                        _, c, _ = self.get_clip_at_playhead()
+                        if c and hasattr(c, "_temp_crop"):
+                            c.crop = c._temp_crop
+                            self._mark_edit(push_undo=False)
                     self._crop_mode = not getattr(self, "_crop_mode", False)
                     if self._crop_mode: self._blur_mode = False
                     return
@@ -1828,21 +2208,88 @@ class Kut:
             # Right panel click
             rx1, ry1, rx2, ry2 = self.layout["right"]
             if ry1 <= y <= ry2 and rx1 <= x <= rx2:
+                # Multiselect toggle
+                if hasattr(self, "_ms_toggle_rect"):
+                    mx1, my1, mx2, my2 = self._ms_toggle_rect
+                    if mx1 <= x <= mx2 and my1 <= y <= my2:
+                        self._track_selection_mode = not getattr(self, "_track_selection_mode", False)
+                        if not self._track_selection_mode:
+                            self._selected_tracks.clear()
+                        return
+                        
+                # Batch buttons
+                if getattr(self, "_track_selection_mode", False):
+                    for action, (bx1, by1, bx2, by2) in getattr(self, "_batch_rects", {}).items():
+                        if bx1 <= x <= bx2 and by1 <= y <= by2:
+                            if action == "join":
+                                self._execute_join_tracks()
+                            elif action == "export":
+                                self._execute_batch_export()
+                            elif action == "delete":
+                                self._save_state()
+                                indices = sorted(self._selected_tracks, reverse=True)
+                                for i in indices:
+                                    if 0 <= i < len(self.clips):
+                                        self._delete_clip_at(i)
+                                self._selected_tracks.clear()
+                                self._mark_edit(push_undo=False)
+                                self._tl_dirty = True
+                            return
+
                 for tdict in getattr(self, "_track_rects", []):
+                    idx = tdict["idx"]
+                    
+                    # Delete
                     dx1, dy1, dx2, dy2 = tdict["del_rect"]
                     if dx1 <= x <= dx2 and dy1 <= y <= dy2:
-                        idx_to_pop = tdict["idx"]
-                        if 0 <= idx_to_pop < len(self.clips):
+                        if 0 <= idx < len(self.clips):
                             self._save_state()
-                            self.clips.pop(idx_to_pop)
+                            self._delete_clip_at(idx)
                             self._mark_edit(push_undo=False)
                             self._tl_dirty = True
                         return
-                    
+                        
+                    # Export single
+                    if "exp_rect" in tdict:
+                        ex1, ey1, ex2, ey2 = tdict["exp_rect"]
+                        if ex1 <= x <= ex2 and ey1 <= y <= ey2:
+                            if 0 <= idx < len(self.clips):
+                                self._execute_export_single(self.clips[idx])
+                            return
+                        
+                    # Rename
+                    if "lbl_rect" in tdict:
+                        lx1, ly1, lx2, ly2 = tdict["lbl_rect"]
+                        if lx1 <= x <= lx2 and ly1 <= y <= ly2:
+                            if 0 <= idx < len(self.clips):
+                                new_name = simpledialog.askstring("Rename Track", "Enter new name:", initialvalue=self.clips[idx].label, parent=self._root())
+                                if new_name is not None:
+                                    self._save_state()
+                                    self.clips[idx].label = new_name
+                                    self._mark_edit(push_undo=False)
+                            return
+
+                    # Checkbox / Selection
+                    if getattr(self, "_track_selection_mode", False) and tdict.get("chk_rect"):
+                        cx1, cy1, cx2, cy2 = tdict["chk_rect"]
+                        if cx1 <= x <= cx2 and cy1 <= y <= cy2:
+                            if idx in self._selected_tracks:
+                                self._selected_tracks.remove(idx)
+                            else:
+                                self._selected_tracks.add(idx)
+                            return
+                            
+                    # Track body
                     cx1, cy1, cx2, cy2 = tdict["rect"]
                     if cx1 <= x <= cx2 and cy1 <= y <= cy2:
-                        self.current_idx = self._clip_offsets[tdict["idx"]]
-                        self._tl_dirty = True
+                        if getattr(self, "_track_selection_mode", False):
+                            if idx in self._selected_tracks:
+                                self._selected_tracks.remove(idx)
+                            else:
+                                self._selected_tracks.add(idx)
+                        else:
+                            self.current_idx = self._clip_offsets[idx]
+                            self._tl_dirty = True
                         return
                 return
 
@@ -2303,7 +2750,7 @@ class Kut:
             c_idx, c, _ = self.get_clip_at_playhead()
             if c is not None and self.clips:
                 self._save_state()
-                self.clips.pop(c_idx)
+                self._delete_clip_at(c_idx)
                 self._mark_edit(push_undo=False)
                 self.current_idx = min(self.current_idx, max(0, self.get_total_frames()-1))
 
@@ -2326,6 +2773,8 @@ class Kut:
         elif key == 26: self.undo()
         elif key == 25: self.redo()
 
+        elif key == 15: self._execute_load_project()
+        elif key == 19: self._execute_save_project(is_auto=False)
         elif key == 9:  self._execute_import()
         elif key == 5:  self._execute_export()
 
@@ -2342,11 +2791,12 @@ class Kut:
 
         elif key in (13, 10): # Enter
             if getattr(self, "_crop_mode", False):
+                self._save_state()
                 self._crop_mode = False
                 _, c, _ = self.get_clip_at_playhead()
                 if c and hasattr(c, "_temp_crop"):
                     c.crop = c._temp_crop
-                    self._mark_edit(push_undo=True)
+                    self._mark_edit(push_undo=False)
                     self._viewport_idx = None
             elif getattr(self, "_blur_mode", False):
                 self._blur_mode = False
@@ -2357,10 +2807,187 @@ class Kut:
         self._tl_dirty = True
 
     # ------------------------------------------------------------------
+    # Project Serialization
+    # ------------------------------------------------------------------
+    def _serialize_clip(self, clip, sources_map):
+        return {
+            "source_idx": sources_map.index(clip.source.path) if clip.source.path in sources_map else -1,
+            "start": clip.start,
+            "end": clip.end,
+            "label": clip.label,
+            "resize_to": clip.resize_to,
+            "crop": clip.crop,
+            "color": clip.color,
+            "id": clip.id,
+            "blur_strokes": getattr(clip, "blur_strokes", [])
+        }
+
+    def _deserialize_clip(self, data, sources_list):
+        s_idx = data.get("source_idx", -1)
+        source = sources_list[s_idx] if 0 <= s_idx < len(sources_list) else None
+        if not source:
+            return None
+        c = Clip(source, data["start"], data["end"], data.get("label", "Clip"),
+                 resize_to=data.get("resize_to"), color=data.get("color"),
+                 clip_id=data.get("id"), crop=data.get("crop"))
+        c.blur_strokes = data.get("blur_strokes", [])
+        return c
+
+    def _get_project_state(self):
+        sources_map = []
+        for s in getattr(self, "_sources", []):
+            if s.path not in sources_map:
+                sources_map.append(s.path)
+        
+        state = {
+            "master_w": self.master_w,
+            "master_h": self.master_h,
+            "master_fps": self.master_fps,
+            "current_idx": self.current_idx,
+            "sources": sources_map,
+            "clips": [self._serialize_clip(c, sources_map) for c in self.clips],
+            "undo_stack": [[self._serialize_clip(c, sources_map) for c in stack_clips] for stack_clips in getattr(self, "_undo_stack", [])],
+            "redo_stack": [[self._serialize_clip(c, sources_map) for c in stack_clips] for stack_clips in getattr(self, "_redo_stack", [])],
+            "global_blur_strokes": getattr(self, "global_blur_strokes", [])
+        }
+        return state
+
+    def _apply_project_state(self, state):
+        self.master_w = state.get("master_w", 1920)
+        self.master_h = state.get("master_h", 1080)
+        self.master_fps = state.get("master_fps", 30.0)
+        self.current_idx = state.get("current_idx", 0)
+        self.global_blur_strokes = state.get("global_blur_strokes", [])
+        
+        self._sources.clear()
+        sources_list = []
+        for path in state.get("sources", []):
+            try:
+                vs = VideoSource(path)
+                self._sources.append(vs)
+                sources_list.append(vs)
+            except Exception:
+                sources_list.append(None)
+                
+        self.clips.clear()
+        for cdata in state.get("clips", []):
+            c = self._deserialize_clip(cdata, sources_list)
+            if c: self.clips.append(c)
+            
+        self._undo_stack.clear()
+        for stack_data in state.get("undo_stack", []):
+            stack = []
+            for cdata in stack_data:
+                c = self._deserialize_clip(cdata, sources_list)
+                if c: stack.append(c)
+            self._undo_stack.append(stack)
+            
+        self._redo_stack.clear()
+        for stack_data in state.get("redo_stack", []):
+            stack = []
+            for cdata in stack_data:
+                c = self._deserialize_clip(cdata, sources_list)
+                if c: stack.append(c)
+            self._redo_stack.append(stack)
+            
+        self._tl_dirty = True
+        self._total_frames_cache = None
+        self._clip_offsets = None
+        self.is_dirty = False
+        
+        self._imported_files.clear()
+        self._file_thumbs.clear()
+        for s in getattr(self, "_sources", []):
+            if hasattr(self, "_register_file"):
+                self._register_file(s.path, s)
+                
+        self._invalidate_clip_index()
+        self.zoom_to_fit()
+        
+    def _execute_save_project(self, is_auto=False):
+        if not is_auto and not getattr(self, "project_path", None):
+            p = filedialog.asksaveasfilename(
+                title="Save Project",
+                defaultextension=".kut",
+                filetypes=[("Kut Project", "*.kut")],
+                parent=getattr(self, "_tk_root", None)
+            )
+            if not p:
+                return
+            self.project_path = p
+            
+        path_to_save = getattr(self, "project_path", None)
+        if is_auto:
+            path_to_save = (self.project_path + ".autosave.kut") if getattr(self, "project_path", None) else os.path.join(get_data_dir(), "autosave.kut")
+            
+        state = self._get_project_state()
+        
+        def _write():
+            try:
+                with open(path_to_save, "w", encoding="utf-8") as f:
+                    json.dump(state, f)
+                if not is_auto:
+                    self.is_dirty = False
+                    self.status_msg = "Project Saved!"
+                    self._add_recent_file(self.project_path)
+            except Exception as e:
+                if not is_auto:
+                    self.status_msg = f"Save failed: {e}"
+                    
+        threading.Thread(target=_write, daemon=True).start()
+        if not is_auto:
+            self.status_msg = "Saving..."
+
+    def _execute_load_project(self, path=None):
+        if self.is_dirty:
+            ans = messagebox.askyesnocancel("Unsaved Changes", "Save current project before opening?", parent=getattr(self, "_tk_root", None))
+            if ans is True:
+                self._execute_save_project(is_auto=False)
+            elif ans is None:
+                return
+                
+        if not path:
+            path = filedialog.askopenfilename(
+                title="Open Project",
+                filetypes=[("Kut Project", "*.kut"), ("All Files", "*.*")],
+                parent=getattr(self, "_tk_root", None)
+            )
+            
+        if not path:
+            return
+            
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            self._apply_project_state(state)
+            self.project_path = path
+            self.status_msg = "Project Loaded"
+            self._add_recent_file(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load project: {e}", parent=getattr(self, "_tk_root", None))
+
+    def _check_crash_recovery(self):
+        auto_path = os.path.join(get_data_dir(), "autosave.kut")
+        if os.path.exists(auto_path):
+            ans = messagebox.askyesno("Crash Recovery", "An unsaved project was found from a previous session. Do you want to recover it?", parent=getattr(self, "_tk_root", None))
+            if ans:
+                self._execute_load_project(auto_path)
+                self.project_path = None
+                self.is_dirty = True
+            else:
+                try: os.remove(auto_path)
+                except: pass
+                
+    # ------------------------------------------------------------------
     # MAIN LOOP
     # ------------------------------------------------------------------
     def run(self):
+        self._check_crash_recovery()
         nav_keys = {65361, 2424832, 65363, 2555904, ord("a"), ord("A"), ord("d"), ord("D")}
+        import time
+        last_time = time.time()
+        play_remainder = 0.0
+        
         while True:
             try:
                 if cv2.getWindowProperty(self.win_name, cv2.WND_PROP_VISIBLE) < 1:
@@ -2369,16 +2996,34 @@ class Kut:
                 pass
             
             self.render()
-            wait_ms = 30 if self.is_playing else 16
+            now = time.time()
+            loop_elapsed = now - last_time
+            last_time = now
+            
+            if self.is_dirty and (now - getattr(self, "_last_auto_save_time", 0)) > getattr(self, "_auto_save_interval", 60.0):
+                self._last_auto_save_time = now
+                self._execute_save_project(is_auto=True)
+            
+            if self.is_playing:
+                target_fps = self.master_fps or 25.0
+                if target_fps <= 0: target_fps = 25.0
+                target_frame_time = 1.0 / target_fps
+                
+                play_remainder += loop_elapsed
+                frames_to_advance = int(play_remainder / target_frame_time)
+                
+                if frames_to_advance > 0 and self.get_total_frames() > 0:
+                    self.current_idx = (self.current_idx + frames_to_advance) % self.get_total_frames()
+                    play_remainder -= frames_to_advance * target_frame_time
+                    self._tl_dirty = True
+                    
+                wait_sec = target_frame_time - play_remainder
+                wait_ms = max(1, int(wait_sec * 1000))
+            else:
+                play_remainder = 0.0
+                wait_ms = 16
+                
             k = cv2.waitKeyEx(wait_ms)
-
-            # if k in (27, ord("q"), ord("Q")):
-            #     if k == 27 and (getattr(self, "_crop_mode", False) or getattr(self, "_blur_mode", False)):
-            #         self._crop_mode = False
-            #         self._blur_mode = False
-            #         self._viewport_idx = None
-            #     else:
-            #         if self._safe_exit(): break
 
             if k != -1:
                 if k in nav_keys:
@@ -2391,10 +3036,6 @@ class Kut:
                     self._handle_key(k, repeat=backlog)
                 else:
                     self._handle_key(k)
-
-            if self.is_playing and self.get_total_frames() > 0:
-                self.current_idx = (self.current_idx + 1) % self.get_total_frames()
-                self._tl_dirty = True
 
         self._worker_active = False
         for s in self._sources: s.release()
