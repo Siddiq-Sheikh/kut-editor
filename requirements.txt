@@ -3,4 +3,4 @@ numpy
 ffmpeg-python
 pyinstaller
 # Note: tkinter is typically included with standard Python on Windows.
-
+# Note: ffmpeg and ffprobe executables MUST be installed and available in the system PATH.

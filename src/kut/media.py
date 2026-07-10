@@ -21,6 +21,36 @@ class VideoSource:
         self.fps = float(raw_fps) if raw_fps and raw_fps > 0 and not np.isnan(raw_fps) else 25.0
         count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.frame_count = count if count > 0 else 10000
+
+        # Try to override with ffprobe for accurate duration and fps
+        try:
+            import subprocess, json
+            cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type,nb_frames,avg_frame_rate,duration", 
+                   "-of", "json", path]
+            out = subprocess.check_output(cmd, creationflags=subprocess.CREATE_NO_WINDOW).decode()
+            info = json.loads(out)
+            
+            fmt_dur = float(info.get("format", {}).get("duration", 0))
+            video_stream = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
+            
+            if video_stream:
+                if "avg_frame_rate" in video_stream:
+                    num, den = video_stream["avg_frame_rate"].split('/')
+                    f_fps = float(num) / float(den) if den != '0' else 0
+                    if f_fps > 0:
+                        self.fps = f_fps
+                        
+                s_dur = float(video_stream.get("duration", 0))
+                f_dur = s_dur if s_dur > 0 else fmt_dur
+                
+                if f_dur > 0 and self.fps > 0:
+                    f_count = int(f_dur * self.fps)
+                    # Always trust ffprobe duration if it differs significantly
+                    if abs(f_count - self.frame_count) > int(self.fps * 0.5):
+                        self.frame_count = f_count
+        except Exception:
+            pass
+
         self._next_read_idx = 0
         self._cache = OrderedDict()
         self._lock = threading.Lock()
