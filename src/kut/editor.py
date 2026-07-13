@@ -31,8 +31,6 @@ class Kut:
     THUMB_SIZE   = 64
     THUMB_W = 114
     THUMB_H = 64
-    THUMB_W = 114
-    THUMB_H = 64
     THUMB_CACHE_MAX = 5000
 
     def __init__(self, video_path=None):
@@ -56,6 +54,8 @@ class Kut:
         self.project_path = None
         self._last_auto_save_time = time.time()
         self._auto_save_interval = 60.0  # 1 minute
+        self.recent_exports = []
+        self._show_downloads_panel = False
         self.is_dirty = False
         self._is_demo = False
 
@@ -235,6 +235,15 @@ class Kut:
         if len(self.recent_files) > 10:
             self.recent_files = self.recent_files[:10]
         self._save_recent_files()
+
+    def _add_recent_export(self, path):
+        if not hasattr(self, "recent_exports"): self.recent_exports = []
+        if path in self.recent_exports:
+            self.recent_exports.remove(path)
+        self.recent_exports.insert(0, path)
+        if len(self.recent_exports) > 3:
+            self.recent_exports = self.recent_exports[:3]
+        self.is_dirty = True
 
     # ------------------------------------------------------------------
     # Layout
@@ -455,53 +464,63 @@ class Kut:
     # ------------------------------------------------------------------
     def _ensure_standard_mp4(self, path):
         try:
-            # Try OpenCV first
-            cap = cv2.VideoCapture(path)
-            ok, _ = cap.read()
-            cap.release()
-            if ok:
+            import json
+            cmd_probe = ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_name", "-of", "json", path]
+            out_probe = subprocess.check_output(cmd_probe, creationflags=subprocess.CREATE_NO_WINDOW).decode()
+            info = json.loads(out_probe)
+            
+            fmt_dur = float(info.get("format", {}).get("duration", 0))
+            streams = info.get("streams", [])
+            codec = streams[0].get("codec_name", "") if streams else ""
+            
+            needs_transcode = False
+            if codec in ("hevc", "h265"):
+                needs_transcode = True
+            elif fmt_dur <= 0:
+                needs_transcode = True
+            else:
+                cap = cv2.VideoCapture(path)
+                ok, _ = cap.read()
+                cap.release()
+                if not ok:
+                    needs_transcode = True
+                    
+            if not needs_transcode:
                 return path
 
-            cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", path]
-            codec = subprocess.check_output(cmd, creationflags=subprocess.CREATE_NO_WINDOW).decode().strip()
-            if codec in ("hevc", "h265"):
-                out_path = os.path.join(get_data_dir(), "transcoded_" + os.path.basename(path) + ".mp4")
-                if os.path.exists(out_path):
-                    return out_path
-                    
-                cmd_dur = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]
-                try:
-                    duration = float(subprocess.check_output(cmd_dur, creationflags=subprocess.CREATE_NO_WINDOW).decode().strip())
-                except:
-                    duration = 0.0
-
-                self.status_msg = "Converting H.265 to MP4... Starting"
-                self.render()
-                cv2.waitKey(1)
-                
-                cmd_conv = ["ffmpeg", "-y", "-i", path, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "aac", "-progress", "-", "-nostats", out_path]
-                process = subprocess.Popen(cmd_conv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                
-                while True:
-                    line = process.stdout.readline()
-                    if not line and process.poll() is not None:
-                        break
-                    if line.startswith("out_time_us="):
-                        try:
-                            us = int(line.split("=")[1].strip())
-                            sec = us / 1000000.0
-                            if duration > 0:
-                                pct = min(100, int((sec / duration) * 100))
-                                self.status_msg = f"Converting H.265... {pct}%"
-                            else:
-                                self.status_msg = f"Converting H.265... {int(sec)}s"
-                            self.render()
-                            cv2.waitKey(1)
-                        except:
-                            pass
-
-                self.status_msg = ""
+            out_path = os.path.join(get_data_dir(), "transcoded_" + os.path.basename(path) + ".mp4")
+            if os.path.exists(out_path):
                 return out_path
+                
+            duration = fmt_dur
+
+            self.status_msg = f"Processing/Fixing Video... Starting"
+            self.render()
+            cv2.waitKey(1)
+            
+            cmd_conv = ["ffmpeg", "-y", "-i", path, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "aac", "-progress", "-", "-nostats", out_path]
+            process = subprocess.Popen(cmd_conv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+                if line.startswith("out_time_us="):
+                    try:
+                        us = int(line.split("=")[1].strip())
+                        sec = us / 1000000.0
+                        if duration > 0:
+                            pct = min(100, int((sec / duration) * 100))
+                            self.status_msg = f"Processing Video... {pct}%"
+                        else:
+                            self.status_msg = f"Processing Video... {int(sec)}s"
+                        self.render()
+                        cv2.waitKey(1)
+                    except:
+                        pass
+
+            self.status_msg = ""
+            return out_path
         except Exception as e:
             if isinstance(e, FileNotFoundError):
                 pass # ffprobe not found
@@ -674,7 +693,6 @@ class Kut:
     def _execute_export(self):
         if getattr(self, "_is_exporting", False) or getattr(self, "_is_dialog_open", False):
             return False
-        self._is_dialog_open = True
             
         total = self.get_total_frames()
         if total == 0: return False
@@ -742,7 +760,7 @@ class Kut:
                                 self.render(); cv2.waitKey(1)
                 finally:
                     writer.release()
-                self.is_dirty = False
+                self._add_recent_export(target)
                 self.status_msg = f"Export Completed: {total} frames"
                 self.status_color = (0, 255, 0)
                 def clear_status():
@@ -785,7 +803,7 @@ class Kut:
                     if written % 10 == 0 or written == len(frames_to_export):
                         self.status_msg = f"Exporting Frames: {written}/{len(frames_to_export)}"
                         self.render(); cv2.waitKey(1)
-                self.is_dirty = False
+                self._add_recent_export(out_dir)
                 self.status_msg = f"Export Completed: {len(frames_to_export)} frames"
                 self.status_color = (0, 255, 0)
                 def clear_status_frames():
@@ -795,8 +813,6 @@ class Kut:
                 return True
         finally:
             self._is_exporting = False
-            self._is_dialog_open = False
-            self._is_dialog_open = False
 
     def _ask_radio(self, title, prompt, options):
         self._is_dialog_open = True
@@ -828,7 +844,6 @@ class Kut:
 
     def _execute_export_single(self, clip):
         if getattr(self, "_is_exporting", False) or getattr(self, "_is_dialog_open", False): return False
-        self._is_dialog_open = True
         choice = self._ask_radio("Export Single Track", "Select export format:", [("Video (MP4)", "video"), ("Image Sequence (Frames)", "frames")])
         if not choice: return False
         
@@ -852,6 +867,7 @@ class Kut:
                             self.render(); cv2.waitKey(1)
                 finally:
                     writer.release()
+                self._add_recent_export(target)
                 self._show_temp_status(f"Export Completed: {len(clip)} frames", (0, 255, 0))
                 return True
             elif choice == "frames":
@@ -882,20 +898,24 @@ class Kut:
                     if i % 10 == 0 or i == len(frames_to_export)-1:
                         self.status_msg = f"Exporting Frames: {i+1}/{len(frames_to_export)}"
                         self.render(); cv2.waitKey(1)
+                self._add_recent_export(out_dir)
                 self._show_temp_status(f"Export Completed: {len(frames_to_export)} frames", (0, 255, 0))
                 return True
         finally:
             self._is_exporting = False
             self._is_dialog_open = False
-            self._is_dialog_open = False
 
     def _execute_batch_export(self):
         if getattr(self, "_is_exporting", False) or getattr(self, "_is_dialog_open", False): return False
-        self._is_dialog_open = True
         clips = [self.clips[i] for i in sorted(self._selected_tracks)]
         if not clips: return False
         
-        out_dir = filedialog.askdirectory(parent=self._root(), title="Select Output Folder for Selected Tracks")
+        self._is_dialog_open = True
+        try:
+            out_dir = filedialog.askdirectory(parent=self._root(), title="Select Output Folder for Selected Tracks")
+        finally:
+            self._is_dialog_open = False
+            
         if not out_dir: return False
         choice = self._ask_radio("Export Format", "Select format for tracks:", [("Video (MP4)", "video"), ("Image Sequence (Frames)", "frames")])
         if not choice: return False
@@ -929,6 +949,7 @@ class Kut:
                                 self.status_msg = f"Exporting {c_idx+1}/{len(clips)}: {li+1}/{len(clip)}"
                                 self.render(); cv2.waitKey(1)
                         writer.release()
+                        self._add_recent_export(target)
                         total_exported_frames += len(clip)
                 elif choice == "frames":
                     total = len(clip)
@@ -950,12 +971,12 @@ class Kut:
                         if i % 10 == 0 or i == len(frames_to_export)-1:
                             self.status_msg = f"Exporting {c_idx+1}/{len(clips)}: {i+1}/{len(frames_to_export)}"
                             self.render(); cv2.waitKey(1)
+                    self._add_recent_export(clip_dir)
                     total_exported_frames += len(frames_to_export)
             self._show_temp_status(f"Batch Export Completed: {total_exported_frames} frames", (0, 255, 0))
             return True
         finally:
             self._is_exporting = False
-            self._is_dialog_open = False
             self._is_dialog_open = False
 
     def _execute_join_tracks(self):
@@ -964,54 +985,45 @@ class Kut:
         if len(indices) < 2:
             self._show_error("Select at least 2 tracks to join.")
             return False
-        
-        target = self._dialog_save()
-        if not target: return False
-        
-        self._is_exporting = True
-        try:
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(target, fourcc, self.master_fps, (self.master_w, self.master_h))
-            if not writer.isOpened():
-                self._show_error("Could not create output file."); return False
             
-            try:
-                for c_idx, i in enumerate(indices):
-                    clip = self.clips[i]
-                    for li in range(len(clip)):
-                        frame = clip.get_frame(li, high_quality=True, global_blur_strokes=self.global_blur_strokes)
-                        if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
-                            frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
-                        writer.write(frame)
-                        if li % 20 == 0 or li == len(clip)-1:
-                            self.status_msg = f"Joining clip {c_idx+1}/{len(indices)}: {li+1}/{len(clip)}"
-                            self.render(); cv2.waitKey(1)
-            finally:
-                writer.release()
-            
-            self._show_temp_status("Join Completed. Re-importing...", (0, 255, 0))
-            
-            from .media import VideoSource, Clip
-            try:
-                new_src = VideoSource(target)
-                new_clip = Clip(new_src, 0, new_src.frame_count, label="Joined Track", resize_to=(self.master_w, self.master_h))
-                self._save_state()
-                for i in reversed(indices):
-                    self.clips.pop(i)
-                insert_idx = indices[0]
-                self.clips.insert(insert_idx, new_clip)
-                self._mark_edit(push_undo=False)
-                self._selected_tracks.clear()
-                self._tl_dirty = True
-                self.current_idx = self._clip_offsets[insert_idx]
-            except Exception as e:
-                self._show_error(f"Error importing joined file: {e}")
+        for i in range(len(indices)-1):
+            if indices[i+1] - indices[i] != 1:
+                self._show_error("Tracks to join must be adjacent in the sequence.")
+                return False
                 
-            return True
-        finally:
-            self._is_exporting = False
-            self._is_dialog_open = False
-            self._is_dialog_open = False
+        first_clip = self.clips[indices[0]]
+        source = first_clip.source
+        current_end = first_clip.end
+        
+        for idx in indices[1:]:
+            c = self.clips[idx]
+            if c.source != source:
+                self._show_error("Tracks must come from the same source to be joined.")
+                return False
+            if c.start != current_end:
+                self._show_error("Tracks must be contiguous in time to be joined.")
+                return False
+            current_end = c.end
+            
+        self._save_state()
+        joined_clip = Clip(source, first_clip.start, current_end, 
+                           label=first_clip.label, resize_to=first_clip.resize_to, 
+                           color=first_clip.color, crop=first_clip.crop)
+        
+        strokes = []
+        for idx in indices:
+            strokes.extend(self.clips[idx].blur_strokes)
+        joined_clip.blur_strokes = strokes
+        
+        self.clips[indices[0]] = joined_clip
+        for idx in reversed(indices[1:]):
+            self.clips.pop(idx)
+            
+        self._selected_tracks.clear()
+        self._track_selection_mode = False
+        self._mark_edit(push_undo=False)
+        self._tl_dirty = True
+        return True
 
     def _show_temp_status(self, msg, color, duration=3.0):
         self.status_msg = msg
@@ -1216,88 +1228,135 @@ class Kut:
         
         self._track_rects = []
 
-        for idx, clip in enumerate(self.clips):
-            if y_cursor + CARD_H > y2 - 40:
-                break
-
-            is_active = (idx == active_idx) and not getattr(self, "_track_selection_mode", False)
-            is_selected = idx in getattr(self, "_selected_tracks", set())
-            cx1 = x1 + CARD_PAD
-            cx2 = x2 - CARD_PAD
-            cy1 = y_cursor
-            cy2 = y_cursor + CARD_H
-
-            bg     = Theme.PANEL_ALT if is_active or is_selected else Theme.PANEL
-            border = Theme.BORDER_ACT if is_active or is_selected else Theme.BORDER
-            UI.rounded_rect(canvas, (cx1, cy1), (cx2, cy2), bg, radius=6,
-                            border_color=border, border_thick=2 if (is_active or is_selected) else 1)
-
-            # Color swatch strip
-            sw_x1, sw_y1 = cx1 + 4, cy1 + 8
-            sw_x2, sw_y2 = cx1 + 12, cy2 - 8
-            UI.rounded_rect(canvas, (sw_x1, sw_y1), (sw_x2, sw_y2), clip.color, radius=2)
-
-            # Track number badge (top-right)
-            badge_lbl = f"{idx+1:02d}"
-            badge_w   = UI.text_w(badge_lbl, 0.28) + 8
-            bx2 = cx2 - 6
-            bx1 = bx2 - badge_w
-            by1 = cy1 + 6
-            by2 = by1 + 14
-            UI.rounded_rect(canvas, (bx1, by1), (bx2, by2), Theme.PANEL_DARK, radius=3,
-                            border_color=Theme.BORDER)
-            UI.text(canvas, badge_lbl, (bx1 + 4, by2 - 3), 0.28, Theme.TEXT_DIM, shadow=False)
-
-            # Label (source filename)
-            lbl_text = clip.label[:18]
-            col = Theme.TEXT_BRIGHT if (is_active or is_selected) else Theme.TEXT
-            lbl_w = UI.text_w(lbl_text, 0.33)
-            UI.text(canvas, lbl_text, (cx1 + 18, cy1 + 22), 0.33, col, shadow=False)
-            lbl_rect = (cx1 + 18, cy1 + 10, cx1 + 18 + lbl_w + 10, cy1 + 28)
-
-            # Duration
-            fps = self.master_fps or 25.0
-            total_s = len(clip) / fps
-            mm = int(total_s // 60)
-            ss = int(total_s % 60)
-            ff = int(round((total_s - int(total_s)) * fps)) % max(1, int(fps))
-            dur_str = f"{mm:02d}:{ss:02d}.{ff:02d}  •  {len(clip)}f"
-            UI.text(canvas, dur_str, (cx1 + 18, cy1 + 42), 0.28, Theme.TEXT_DIM, shadow=False)
-
-            # ── Export icon button ────────────────────────────────────
-            exp_cx = cx2 - 34
-            exp_cy = cy2 - 14
-            cv2.rectangle(canvas, (exp_cx - 4, exp_cy - 4), (exp_cx + 4, exp_cy + 4), Theme.TEXT_DIM, 1)
-            cv2.arrowedLine(canvas, (exp_cx, exp_cy - 6), (exp_cx, exp_cy), Theme.TEXT_DIM, 1, tipLength=0.4)
-            cv2.line(canvas, (exp_cx - 5, exp_cy + 6), (exp_cx + 5, exp_cy + 6), Theme.TEXT_DIM, 1)
+        track_area_y1 = y_cursor
+        track_area_y2 = y2
+        if getattr(self, "_track_selection_mode", False) and len(getattr(self, "_selected_tracks", set())) > 0:
+            track_area_y2 = y2 - 35
             
-            # ── Trash icon button ────────────────────────────────────
-            trash_cx = cx2 - 14
-            trash_cy = cy2 - 14
-            UI.draw_trash_icon(canvas, trash_cx, trash_cy, size=8, color=Theme.DANGER)
+        track_area_h = track_area_y2 - track_area_y1
+        if track_area_h > 0:
+            track_canvas = np.full((track_area_h, panel_w, 3), Theme.PANEL_DARK, dtype=np.uint8)
+            
+            content_h = len(self.clips) * (CARD_H + 4)
+            max_scroll = max(0, content_h - track_area_h)
+            if not hasattr(self, "_right_scroll"): self._right_scroll = 0
+            self._right_scroll = max(0, min(self._right_scroll, max_scroll))
 
-            # Checkbox for multiselect
-            chk_rect = None
-            if getattr(self, "_track_selection_mode", False):
-                chk_x1, chk_y1 = cx1 + 16, cy2 - 20
-                chk_x2, chk_y2 = chk_x1 + 12, chk_y1 + 12
-                UI.rounded_rect(canvas, (chk_x1, chk_y1), (chk_x2, chk_y2), Theme.PANEL_DARK, radius=2, border_color=Theme.BORDER)
-                if is_selected:
-                    cv2.line(canvas, (chk_x1 + 3, chk_y1 + 6), (chk_x1 + 5, chk_y1 + 9), Theme.TEXT_BRIGHT, 1)
-                    cv2.line(canvas, (chk_x1 + 5, chk_y1 + 9), (chk_x1 + 9, chk_y1 + 3), Theme.TEXT_BRIGHT, 1)
-                chk_rect = (chk_x1 - 5, chk_y1 - 5, chk_x2 + 5, chk_y2 + 5)
+            local_y = -self._right_scroll
 
-            # Store hit rects
-            self._track_rects.append({
-                "idx": idx,
-                "rect": (cx1, cy1, cx2, cy2),
-                "del_rect": (trash_cx - 10, trash_cy - 10, trash_cx + 10, trash_cy + 10),
-                "exp_rect": (exp_cx - 10, exp_cy - 10, exp_cx + 10, exp_cy + 10),
-                "lbl_rect": lbl_rect,
-                "chk_rect": chk_rect
-            })
+            for idx, clip in enumerate(self.clips):
+                if local_y > track_area_h:
+                    break
+                if local_y + CARD_H < 0:
+                    local_y += CARD_H + 4
+                    continue
 
-            y_cursor += CARD_H + 4
+                is_active = (idx == active_idx) and not getattr(self, "_track_selection_mode", False)
+                is_selected = idx in getattr(self, "_selected_tracks", set())
+                cx1 = CARD_PAD
+                cx2 = panel_w - CARD_PAD
+                cy1 = local_y
+                cy2 = local_y + CARD_H
+
+                bg     = Theme.PANEL_ALT if is_active or is_selected else Theme.PANEL
+                border = Theme.BORDER_ACT if is_active or is_selected else Theme.BORDER
+                UI.rounded_rect(track_canvas, (cx1, cy1), (cx2, cy2), bg, radius=6,
+                                border_color=border, border_thick=2 if (is_active or is_selected) else 1)
+
+                # Color swatch strip
+                sw_x1, sw_y1 = cx1 + 4, cy1 + 8
+                sw_x2, sw_y2 = cx1 + 12, cy2 - 8
+                UI.rounded_rect(track_canvas, (sw_x1, sw_y1), (sw_x2, sw_y2), clip.color, radius=2)
+
+                # Track number badge (top-right)
+                badge_lbl = f"{idx+1:02d}"
+                badge_w   = UI.text_w(badge_lbl, 0.28) + 8
+                bx2 = cx2 - 6
+                bx1 = bx2 - badge_w
+                by1 = cy1 + 6
+                by2 = by1 + 14
+                UI.rounded_rect(track_canvas, (bx1, by1), (bx2, by2), Theme.PANEL_DARK, radius=3,
+                                border_color=Theme.BORDER)
+                UI.text(track_canvas, badge_lbl, (bx1 + 4, by2 - 3), 0.28, Theme.TEXT_DIM, shadow=False)
+
+                # Label (source filename)
+                lbl_text = clip.label[:18]
+                col = Theme.TEXT_BRIGHT if (is_active or is_selected) else Theme.TEXT
+                lbl_w = UI.text_w(lbl_text, 0.33)
+                UI.text(track_canvas, lbl_text, (cx1 + 18, cy1 + 22), 0.33, col, shadow=False)
+                lbl_rect_local = (cx1 + 18, cy1 + 10, cx1 + 18 + lbl_w + 10, cy1 + 28)
+
+                # Duration
+                fps = self.master_fps or 25.0
+                total_s = len(clip) / fps
+                mm = int(total_s // 60)
+                ss = int(total_s % 60)
+                ff = int(round((total_s - int(total_s)) * fps)) % max(1, int(fps))
+                dur_str = f"{mm:02d}:{ss:02d}.{ff:02d}  •  {len(clip)}f"
+                UI.text(track_canvas, dur_str, (cx1 + 18, cy1 + 42), 0.28, Theme.TEXT_DIM, shadow=False)
+
+                # ── Export icon button ────────────────────────────────────
+                exp_cx = cx2 - 34
+                exp_cy = cy2 - 14
+                cv2.rectangle(track_canvas, (exp_cx - 4, exp_cy - 4), (exp_cx + 4, exp_cy + 4), Theme.TEXT_DIM, 1)
+                cv2.arrowedLine(track_canvas, (exp_cx, exp_cy - 6), (exp_cx, exp_cy), Theme.TEXT_DIM, 1, tipLength=0.4)
+                cv2.line(track_canvas, (exp_cx - 5, exp_cy + 6), (exp_cx + 5, exp_cy + 6), Theme.TEXT_DIM, 1)
+                
+                # ── Trash icon button ────────────────────────────────────
+                trash_cx = cx2 - 14
+                trash_cy = cy2 - 14
+                UI.draw_trash_icon(track_canvas, trash_cx, trash_cy, size=8, color=Theme.DANGER)
+
+                # Checkbox for multiselect
+                chk_rect_local = None
+                if getattr(self, "_track_selection_mode", False):
+                    chk_x1, chk_y1 = cx1 + 16, cy2 - 20
+                    chk_x2, chk_y2 = chk_x1 + 12, chk_y1 + 12
+                    UI.rounded_rect(track_canvas, (chk_x1, chk_y1), (chk_x2, chk_y2), Theme.PANEL_DARK, radius=2, border_color=Theme.BORDER)
+                    if is_selected:
+                        cv2.line(track_canvas, (chk_x1 + 3, chk_y1 + 6), (chk_x1 + 5, chk_y1 + 9), Theme.TEXT_BRIGHT, 1)
+                        cv2.line(track_canvas, (chk_x1 + 5, chk_y1 + 9), (chk_x1 + 9, chk_y1 + 3), Theme.TEXT_BRIGHT, 1)
+                    chk_rect_local = (chk_x1 - 5, chk_y1 - 5, chk_x2 + 5, chk_y2 + 5)
+
+                # Global coordinates for hit testing
+                g_cx1 = x1 + cx1
+                g_cy1 = track_area_y1 + cy1
+                g_cx2 = x1 + cx2
+                g_cy2 = track_area_y1 + cy2
+                
+                g_trash_cx = x1 + trash_cx
+                g_trash_cy = track_area_y1 + trash_cy
+                g_exp_cx = x1 + exp_cx
+                g_exp_cy = track_area_y1 + exp_cy
+                
+                chk_rect = None
+                if chk_rect_local:
+                    chk_rect = (x1 + chk_rect_local[0], track_area_y1 + chk_rect_local[1],
+                                x1 + chk_rect_local[2], track_area_y1 + chk_rect_local[3])
+                                
+                lbl_rect = (x1 + lbl_rect_local[0], track_area_y1 + lbl_rect_local[1],
+                            x1 + lbl_rect_local[2], track_area_y1 + lbl_rect_local[3])
+
+                self._track_rects.append({
+                    "idx": idx,
+                    "rect": (g_cx1, g_cy1, g_cx2, g_cy2),
+                    "del_rect": (g_trash_cx - 10, g_trash_cy - 10, g_trash_cx + 10, g_trash_cy + 10),
+                    "exp_rect": (g_exp_cx - 10, g_exp_cy - 10, g_exp_cx + 10, g_exp_cy + 10),
+                    "lbl_rect": lbl_rect,
+                    "chk_rect": chk_rect
+                })
+
+                local_y += CARD_H + 4
+                
+            # Scrollbar
+            if max_scroll > 0:
+                sb_w = 4
+                sb_h = max(20, int(track_area_h * (track_area_h / content_h)))
+                sb_x = panel_w - sb_w - 2
+                sb_y = int((self._right_scroll / max_scroll) * (track_area_h - sb_h))
+                cv2.rectangle(track_canvas, (sb_x, sb_y), (sb_x + sb_w, sb_y + sb_h), Theme.TEXT_DIM, -1)
+
+            canvas[track_area_y1:track_area_y2, x1:x2] = track_canvas
 
         # Batch actions
         self._batch_rects = {}
@@ -1956,14 +2015,85 @@ class Kut:
             UI.text(canvas, desc, (cx, mid), 0.27, Theme.TEXT_DIM, shadow=False)
             cx += UI.text_w(desc, 0.27) + 14
 
+        # Downloads button
+        dl_cx = x2 - 20
+        dl_cy = y1 + fh // 2
+        dl_r = 12
+        hovered = (getattr(self, "_hover_id", None) == "downloads")
+        is_open = getattr(self, "_show_downloads_panel", False)
+        bg_col = Theme.ACCENT if is_open else (Theme.PANEL_ALT if hovered else Theme.PANEL)
+        cv2.circle(canvas, (dl_cx, dl_cy), dl_r, bg_col, -1)
+        cv2.circle(canvas, (dl_cx, dl_cy), dl_r, Theme.BORDER_HI if hovered else Theme.BORDER, 1)
+        
+        arr_col = Theme.BG if is_open else (Theme.TEXT_BRIGHT if hovered else Theme.TEXT_DIM)
+        cv2.line(canvas, (dl_cx, dl_cy - 4), (dl_cx, dl_cy + 4), arr_col, 2)
+        cv2.line(canvas, (dl_cx, dl_cy + 4), (dl_cx - 3, dl_cy + 1), arr_col, 2)
+        cv2.line(canvas, (dl_cx, dl_cy + 4), (dl_cx + 3, dl_cy + 1), arr_col, 2)
+        
+        self._downloads_btn_rect = (dl_cx - dl_r, dl_cy - dl_r, dl_cx + dl_r, dl_cy + dl_r)
+
         # Status message (right-aligned, accent)
         if getattr(self, "status_msg", ""):
             color = getattr(self, "status_color", None) or Theme.ACCENT
             sw  = UI.text_w(self.status_msg, 0.32)
-            dot_x = x2 - sw - 26
+            dot_x = x2 - sw - 60
             cv2.circle(canvas, (dot_x, mid - 2), 3, color, -1)
             UI.text(canvas, self.status_msg, (dot_x + 10, mid), 0.32, color, shadow=False)
 
+
+    # ------------------------------------------------------------------
+    # DRAW — Downloads Panel
+    # ------------------------------------------------------------------
+    def _draw_downloads_panel(self, canvas):
+        if not getattr(self, "_show_downloads_panel", False):
+            self._dl_panel_hit_rects = []
+            return
+            
+        x1, y1, x2, y2 = self.layout["footer"]
+        panel_w = 340
+        panel_h = 50 + len(self.recent_exports) * 45 if self.recent_exports else 80
+        px1 = x2 - panel_w - 10
+        px2 = px1 + panel_w
+        py2 = y1 - 10
+        py1 = py2 - panel_h
+        
+        # Panel background
+        UI.rounded_rect(canvas, (px1, py1), (px2, py2), Theme.PANEL, radius=8, border_color=Theme.BORDER_HI, border_thick=1)
+        
+        # Title
+        UI.text(canvas, "Recent Exports", (px1 + 15, py1 + 25), 0.4, Theme.TEXT_BRIGHT, shadow=False)
+        cv2.line(canvas, (px1 + 15, py1 + 35), (px2 - 15, py1 + 35), Theme.BORDER, 1)
+        
+        self._dl_panel_hit_rects = []
+        cy = py1 + 45
+        if not self.recent_exports:
+            UI.text(canvas, "No exports in this project yet.", (px1 + 15, cy + 15), 0.35, Theme.TEXT_DIM, shadow=False)
+        else:
+            for i, path in enumerate(self.recent_exports):
+                fname = os.path.basename(path)
+                if len(fname) > 30: fname = fname[:27] + "..."
+                UI.text(canvas, fname, (px1 + 15, cy + 12), 0.35, Theme.TEXT, shadow=False)
+                
+                # Buttons
+                bx1_open = px2 - 145
+                by1_btn = cy
+                bx2_open = bx1_open + 45
+                by2_btn = by1_btn + 22
+                
+                hover_open = (getattr(self, "_hover_id", None) == f"dl_open_{i}")
+                UI.rounded_rect(canvas, (bx1_open, by1_btn), (bx2_open, by2_btn), Theme.PANEL_ALT if hover_open else Theme.BG, radius=4, border_color=Theme.BORDER_HI if hover_open else Theme.BORDER)
+                UI.text(canvas, "Open", (bx1_open + 6, by2_btn - 6), 0.28, Theme.ACCENT if hover_open else Theme.TEXT_DIM, shadow=False)
+                
+                bx1_fold = bx2_open + 5
+                bx2_fold = bx1_fold + 85
+                hover_fold = (getattr(self, "_hover_id", None) == f"dl_folder_{i}")
+                UI.rounded_rect(canvas, (bx1_fold, by1_btn), (bx2_fold, by2_btn), Theme.PANEL_ALT if hover_fold else Theme.BG, radius=4, border_color=Theme.BORDER_HI if hover_fold else Theme.BORDER)
+                UI.text(canvas, "Location", (bx1_fold + 16, by2_btn - 6), 0.28, Theme.ACCENT if hover_fold else Theme.TEXT_DIM, shadow=False)
+                
+                self._dl_panel_hit_rects.append(((bx1_open, by1_btn, bx2_open, by2_btn), "open", path, f"dl_open_{i}"))
+                self._dl_panel_hit_rects.append(((bx1_fold, by1_btn, bx2_fold, by2_btn), "folder", path, f"dl_folder_{i}"))
+                
+                cy += 40
 
     # ------------------------------------------------------------------
     # DRAW — Help overlay
@@ -2105,6 +2235,9 @@ class Kut:
             sub = "Drop on timeline"
             UI.text(canvas, sub, (tx, ty + 18), 0.27, Theme.ACCENT, shadow=False)
 
+        if getattr(self, "_show_downloads_panel", False):
+            self._draw_downloads_panel(canvas)
+
         cv2.imshow(self.win_name, canvas)
 
     # ------------------------------------------------------------------
@@ -2127,8 +2260,8 @@ class Kut:
                         if not self._safe_exit(): return
                         src = fdict["source"]
                         lbl = fdict["label"]
-                        resize_to = (self.master_w, self.master_h) if (src.width, src.height) != (self.master_w, self.master_h) else None
-                        self.clips = [Clip(src, 0, src.frame_count, label=lbl, resize_to=resize_to)]
+                        self.master_w, self.master_h, self.master_fps = src.width, src.height, src.fps
+                        self.clips = [Clip(src, 0, src.frame_count, label=lbl, resize_to=None)]
                         self.current_idx = 0
                         self.current_video_path = fdict["path"]
                         self.is_dirty = False
@@ -2142,6 +2275,36 @@ class Kut:
                         return
 
         elif event == cv2.EVENT_LBUTTONDOWN:
+            # Downloads panel overlay
+            if getattr(self, "_show_downloads_panel", False):
+                for rect, action, val, hid in getattr(self, "_dl_panel_hit_rects", []):
+                    rx1, ry1, rx2, ry2 = rect
+                    if rx1 <= x <= rx2 and ry1 <= y <= ry2:
+                        if action == "open":
+                            try: os.startfile(val)
+                            except: pass
+                        elif action == "folder":
+                            try:
+                                import os
+                                val_norm = os.path.normpath(val)
+                                if os.path.isdir(val_norm): os.startfile(val_norm)
+                                else: os.startfile(os.path.dirname(val_norm))
+                            except: pass
+                        return
+                
+                dx1, dy1, dx2, dy2 = getattr(self, "_downloads_btn_rect", (0,0,0,0))
+                if dx1 <= x <= dx2 and dy1 <= y <= dy2:
+                    self._show_downloads_panel = False
+                    return
+                
+                self._show_downloads_panel = False
+                return
+            else:
+                dx1, dy1, dx2, dy2 = getattr(self, "_downloads_btn_rect", (0,0,0,0))
+                if dx1 <= x <= dx2 and dy1 <= y <= dy2:
+                    self._show_downloads_panel = True
+                    return
+
             # Toolbar
             if y < self.layout["toolbar"][3]:
                 bid = self._hit_toolbar(x, y)
@@ -2585,8 +2748,28 @@ class Kut:
                 self._viewport_pan_y = self._drag_vp_pan_start_y + (y - self._drag_vp_start_y)
                 self._viewport_idx = None
 
-            if y < self.layout["toolbar"][3]:
+            if getattr(self, "_show_downloads_panel", False):
+                hit = False
+                for rect, action, val, hid in getattr(self, "_dl_panel_hit_rects", []):
+                    rx1, ry1, rx2, ry2 = rect
+                    if rx1 <= x <= rx2 and ry1 <= y <= ry2:
+                        self._hover_id = hid
+                        hit = True
+                        break
+                if not hit:
+                    dx1, dy1, dx2, dy2 = getattr(self, "_downloads_btn_rect", (0,0,0,0))
+                    if dx1 <= x <= dx2 and dy1 <= y <= dy2:
+                        self._hover_id = "downloads"
+                    else:
+                        self._hover_id = None
+            elif y < self.layout["toolbar"][3]:
                 self._hover_id = self._hit_toolbar(x, y)
+            elif y > self.layout["footer"][1]:
+                dx1, dy1, dx2, dy2 = getattr(self, "_downloads_btn_rect", (0,0,0,0))
+                if dx1 <= x <= dx2 and dy1 <= y <= dy2:
+                    self._hover_id = "downloads"
+                else:
+                    self._hover_id = None
             else:
                 self._hover_id = None
 
@@ -2601,7 +2784,12 @@ class Kut:
                 if tl_x1 <= x <= tl_x2 and tl_y1 <= y <= tl_y2:
                     src = self._drag_file_dict["source"]
                     lbl = self._drag_file_dict["label"]
-                    resize_to = (self.master_w, self.master_h) if (src.width, src.height) != (self.master_w, self.master_h) else None
+                    if not self.clips:
+                        self.master_w, self.master_h, self.master_fps = src.width, src.height, src.fps
+                        resize_to = None
+                    else:
+                        resize_to = (self.master_w, self.master_h) if (src.width, src.height) != (self.master_w, self.master_h) else None
+                    
                     new_clip = Clip(src, 0, src.frame_count, label=lbl, resize_to=resize_to)
                     
                     gf = self._tl_x_to_frame(x)
@@ -2694,6 +2882,11 @@ class Kut:
                     else:
                         self._viewport_pan_y += -60 if up else 60
                         self._viewport_idx = None
+                else:
+                    rx1, ry1, rx2, ry2 = self.layout["right"]
+                    if ry1 <= y <= ry2 and rx1 <= x <= rx2:
+                        if not hasattr(self, "_right_scroll"): self._right_scroll = 0
+                        self._right_scroll += -60 if up else 60
 
     # ------------------------------------------------------------------
     # KEYBOARD
@@ -2854,7 +3047,8 @@ class Kut:
             "clips": [self._serialize_clip(c, sources_map) for c in self.clips],
             "undo_stack": [[self._serialize_clip(c, sources_map) for c in stack_clips] for stack_clips in getattr(self, "_undo_stack", [])],
             "redo_stack": [[self._serialize_clip(c, sources_map) for c in stack_clips] for stack_clips in getattr(self, "_redo_stack", [])],
-            "global_blur_strokes": getattr(self, "global_blur_strokes", [])
+            "global_blur_strokes": getattr(self, "global_blur_strokes", []),
+            "recent_exports": getattr(self, "recent_exports", [])
         }
         return state
 
@@ -2864,6 +3058,7 @@ class Kut:
         self.master_fps = state.get("master_fps", 30.0)
         self.current_idx = state.get("current_idx", 0)
         self.global_blur_strokes = state.get("global_blur_strokes", [])
+        self.recent_exports = state.get("recent_exports", [])
         
         self._sources.clear()
         sources_list = []
@@ -2924,7 +3119,18 @@ class Kut:
             
         path_to_save = getattr(self, "project_path", None)
         if is_auto:
-            path_to_save = (self.project_path + ".autosave.kut") if getattr(self, "project_path", None) else os.path.join(get_data_dir(), "autosave.kut")
+            if path_to_save:
+                path_to_save = path_to_save + ".autosave.kut"
+            else:
+                base = "Untitled"
+                if self.clips:
+                    base = os.path.splitext(os.path.basename(self.clips[0].source.path))[0]
+                elif getattr(self, "current_video_path", None):
+                    base = os.path.splitext(os.path.basename(self.current_video_path))[0]
+                
+                autosave_dir = os.path.join(get_data_dir(), "Autosaves")
+                os.makedirs(autosave_dir, exist_ok=True)
+                path_to_save = os.path.join(autosave_dir, f"{base}.kut")
             
         state = self._get_project_state()
         
@@ -2936,6 +3142,9 @@ class Kut:
                     self.is_dirty = False
                     self.status_msg = "Project Saved!"
                     self._add_recent_file(self.project_path)
+                else:
+                    if not getattr(self, "project_path", None):
+                        self._add_recent_file(path_to_save)
             except Exception as e:
                 if not is_auto:
                     self.status_msg = f"Save failed: {e}"
@@ -2972,23 +3181,10 @@ class Kut:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load project: {e}", parent=getattr(self, "_tk_root", None))
 
-    def _check_crash_recovery(self):
-        auto_path = os.path.join(get_data_dir(), "autosave.kut")
-        if os.path.exists(auto_path):
-            ans = messagebox.askyesno("Crash Recovery", "An unsaved project was found from a previous session. Do you want to recover it?", parent=getattr(self, "_tk_root", None))
-            if ans:
-                self._execute_load_project(auto_path)
-                self.project_path = None
-                self.is_dirty = True
-            else:
-                try: os.remove(auto_path)
-                except: pass
-                
     # ------------------------------------------------------------------
     # MAIN LOOP
     # ------------------------------------------------------------------
     def run(self):
-        self._check_crash_recovery()
         nav_keys = {65361, 2424832, 65363, 2555904, ord("a"), ord("A"), ord("d"), ord("D")}
         import time
         last_time = time.time()
