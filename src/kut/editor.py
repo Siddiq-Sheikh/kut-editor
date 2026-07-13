@@ -31,6 +31,8 @@ class Kut:
     THUMB_SIZE   = 64
     THUMB_W = 114
     THUMB_H = 64
+    THUMB_W = 114
+    THUMB_H = 64
     THUMB_CACHE_MAX = 5000
 
     def __init__(self, video_path=None):
@@ -794,6 +796,7 @@ class Kut:
         finally:
             self._is_exporting = False
             self._is_dialog_open = False
+            self._is_dialog_open = False
 
     def _ask_radio(self, title, prompt, options):
         self._is_dialog_open = True
@@ -884,6 +887,7 @@ class Kut:
         finally:
             self._is_exporting = False
             self._is_dialog_open = False
+            self._is_dialog_open = False
 
     def _execute_batch_export(self):
         if getattr(self, "_is_exporting", False) or getattr(self, "_is_dialog_open", False): return False
@@ -952,6 +956,7 @@ class Kut:
         finally:
             self._is_exporting = False
             self._is_dialog_open = False
+            self._is_dialog_open = False
 
     def _execute_join_tracks(self):
         if getattr(self, "_is_exporting", False): return False
@@ -1005,6 +1010,7 @@ class Kut:
             return True
         finally:
             self._is_exporting = False
+            self._is_dialog_open = False
             self._is_dialog_open = False
 
     def _show_temp_status(self, msg, color, duration=3.0):
