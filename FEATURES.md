@@ -29,7 +29,8 @@ Kut is a lightweight, OpenCV-based video editor tailored for speed, simplicity, 
 * **Project Save & Load:** Save your complete workspace (timeline cuts, edits, and crop/blur states) to a `.kut` project file using `Ctrl+S`. Load existing projects using `Ctrl+O` or the top toolbar.
 * **Intelligent Auto-Save:** Automatically saves your work in the background every 60 seconds without freezing the UI or interrupting playback.
 * **Crash Recovery:** Instantly detects if the application previously closed with unsaved edits and prompts you to recover your exact session upon startup.
-* **Smart Exporter:** Export your final composed sequence as a standard `.mp4` video file using the dedicated Video Export button.
+* **Unified Background Exporting:** Export your final sequence as a `.mp4` video or an Image Sequence (with FPS, Fixed Count, or Interval modes) via a single unified dialog. Exports are processed in the background so you can continue editing!
+* **Downloads & Progress Panel:** Monitor background exports in the footer's scrollable Downloads panel, complete with circular progress loaders, cancellation buttons, and quick links to open the exported files.
 * **Unsaved Changes Protection:** Prevents accidental data loss by prompting you to save your project before opening a new one or closing the application.
 
 ---

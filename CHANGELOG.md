@@ -2,9 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Version 3.0]
+## [Version 4.0]
 
 ### Added
+- **Unified Export Dialog**: Overhauled the export flow into a single, comprehensive dialog for choosing formats (Video or Image Sequence), selecting output destinations (with context-aware file vs folder selection), and configuring frame extraction settings all in one place.
+- **Background Export Processing**: Exports are now queued and processed in a non-blocking background thread. You can continue editing your timeline seamlessly while multiple exports run in the background.
+- **Enhanced Downloads Panel**: Redesigned the downloads panel with a sleek circular progress loader for active exports, a built-in 'X' cancel button to abort ongoing jobs, and mouse-wheel scrolling (showing 2 items at a time).
+- **Interval Extraction Mode**: Added a new "Interval (s)" mode when exporting frames, allowing you to easily extract 1 frame every X seconds, complete with a real-time calculator that shows exactly how many frames will be generated before you start.
+- **Footer UI Updates**: The Downloads button in the footer now features a dynamic circular loader ring when an export is actively running.
+
+## [Version 3.0]
 - **Project Save & Load**: You can now save your full workspace (cuts, crops, edits, clips) as a `.kut` project file using the new "Save" and "Open" toolbar buttons or via `Ctrl+S` / `Ctrl+O`.
 - **Intelligent Auto-Save**: A background thread auto-saves your active project every 60 seconds without freezing the UI or interrupting playback.
 - **Crash Recovery**: The editor automatically detects if you crashed with unsaved work from a previous session and prompts you to recover it upon startup.

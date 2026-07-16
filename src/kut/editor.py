@@ -21,6 +21,23 @@ from .media import VideoSource, Clip, _clip_id_counter, _clip_color_counter
 
 # MAIN EDITOR
 # ---------------------------------------------------------------------------
+class ExportJob:
+    def __init__(self, job_type, target_path, frames_to_export, fps, dimensions, clips, global_blur_strokes):
+        self.job_type = job_type  # 'video' or 'frames'
+        self.target_path = target_path
+        self.frames_to_export = frames_to_export  # List of frames to export (indices), or total frame count for video
+        self.fps = fps
+        self.dimensions = dimensions
+        self.clips = clips  # Shallow copy of clips
+        self.global_blur_strokes = global_blur_strokes
+        self.processed_frames = 0
+        self.total_frames = len(frames_to_export) if job_type == 'frames' else frames_to_export
+        self.status = "Queued"  # Queued, Exporting, Completed, Cancelled, Error
+        self.cancel_flag = False
+        self.error_msg = ""
+        import uuid
+        self.id = str(uuid.uuid4())
+
 class Kut:
     # ---- layout constants (pixels) ----
     TOOLBAR_H    = 64          # taller toolbar
@@ -55,9 +72,16 @@ class Kut:
         self._last_auto_save_time = time.time()
         self._auto_save_interval = 60.0  # 1 minute
         self.recent_exports = []
+        self.active_exports = []
+        self.export_queue = queue.Queue()
+        self._dl_scroll_offset = 0
         self._show_downloads_panel = False
         self.is_dirty = False
         self._is_demo = False
+
+        # Start background export worker
+        self._export_worker_thread = threading.Thread(target=self._export_worker_loop, daemon=True)
+        self._export_worker_thread.start()
 
         self.clips     = []
         self._sources  = []
@@ -474,17 +498,12 @@ class Kut:
             codec = streams[0].get("codec_name", "") if streams else ""
             
             needs_transcode = False
-            if codec in ("hevc", "h265"):
+            cap = cv2.VideoCapture(path)
+            ok, _ = cap.read()
+            cap.release()
+            if not ok:
                 needs_transcode = True
-            elif fmt_dur <= 0:
-                needs_transcode = True
-            else:
-                cap = cv2.VideoCapture(path)
-                ok, _ = cap.read()
-                cap.release()
-                if not ok:
-                    needs_transcode = True
-                    
+                
             if not needs_transcode:
                 return path
 
@@ -690,6 +709,218 @@ class Kut:
                 pass
 
 
+    def _export_worker_loop(self):
+        while True:
+            job = self.export_queue.get()
+            if job is None:
+                break
+            
+            job.status = "Exporting"
+            
+            try:
+                if job.job_type == "video":
+                    self._run_video_export(job)
+                elif job.job_type == "frames":
+                    self._run_frames_export(job)
+                
+                if job.cancel_flag:
+                    job.status = "Cancelled"
+                    self._show_temp_status("Export Cancelled", (255, 165, 0))
+                else:
+                    job.status = "Completed"
+                    self._add_recent_export(job.target_path)
+                    self._show_temp_status(f"Export Completed: {job.processed_frames} frames", (0, 255, 0))
+            except Exception as e:
+                job.status = "Error"
+                job.error_msg = str(e)
+            
+            # Keep completed/cancelled jobs in active_exports for a bit, or move them? 
+            # The downloads panel will show them.
+            self.export_queue.task_done()
+            
+    def _run_video_export(self, job):
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(job.target_path, fourcc, job.fps, job.dimensions)
+        if not writer.isOpened():
+            raise IOError("Could not create output file.")
+        
+        try:
+            for clip in job.clips:
+                for li in range(len(clip)):
+                    if job.cancel_flag:
+                        return
+                    frame = clip.get_frame(li, high_quality=True, global_blur_strokes=job.global_blur_strokes)
+                    if (frame.shape[1], frame.shape[0]) != job.dimensions:
+                        frame = cv2.resize(frame, job.dimensions, interpolation=cv2.INTER_CUBIC)
+                    writer.write(frame)
+                    job.processed_frames += 1
+        finally:
+            writer.release()
+            
+    def _run_frames_export(self, job):
+        for gf in job.frames_to_export:
+            if job.cancel_flag:
+                return
+            
+            # Since clips are a shallow copy, we need to map global frame 'gf' to clip and local index.
+            # We reconstruct _get_clip_at_frame logic for this static snapshot of clips.
+            c = None
+            l_idx = 0
+            cur_gf = 0
+            for clip in job.clips:
+                clip_len = len(clip)
+                if cur_gf <= gf < cur_gf + clip_len:
+                    c = clip
+                    l_idx = gf - cur_gf
+                    break
+                cur_gf += clip_len
+                
+            if c:
+                frame = c.get_frame(l_idx, high_quality=True, global_blur_strokes=job.global_blur_strokes)
+                if (frame.shape[1], frame.shape[0]) != job.dimensions:
+                    frame = cv2.resize(frame, job.dimensions, interpolation=cv2.INTER_CUBIC)
+                
+                # out_dir is target_path
+                base_name = os.path.basename(job.target_path) if not os.path.isdir(job.target_path) else "export"
+                if os.path.isdir(job.target_path):
+                    fname = os.path.join(job.target_path, f"frame_{job.processed_frames+1:03d}.jpg")
+                else:
+                    out_dir = os.path.dirname(job.target_path)
+                    name_no_ext = os.path.splitext(base_name)[0]
+                    fname = os.path.join(out_dir, f"{name_no_ext}_{job.processed_frames+1:03d}.jpg")
+                    
+                cv2.imwrite(fname, frame)
+            job.processed_frames += 1
+
+    def _show_unified_export_dialog(self, title, total_frames, master_fps, is_batch=False):
+        self._is_dialog_open = True
+        import tkinter as tk
+        from tkinter import filedialog, messagebox
+        root = self._root()
+        top = tk.Toplevel(root)
+        top.title(title)
+        top.geometry("420x350")
+        top.attributes("-topmost", True)
+        top.resizable(False, False)
+        
+        format_var = tk.StringVar(value="video")
+        path_var = tk.StringVar(value="")
+        mode_var = tk.StringVar(value="fps")
+        val_var = tk.StringVar(value="1")
+        
+        # Format Section
+        tk.Label(top, text="1. Export Format", font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 5))
+        fmt_frame = tk.Frame(top)
+        fmt_frame.pack(fill="x", padx=20)
+        
+        # Path Section
+        tk.Label(top, text="2. Output Destination", font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=(15, 5))
+        path_frame = tk.Frame(top)
+        path_frame.pack(fill="x", padx=20)
+        
+        # We use a standard Entry (not readonly) so we can see the text, but disable typing.
+        path_entry = tk.Entry(path_frame, textvariable=path_var, width=40)
+        path_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        path_entry.config(state="readonly")
+        
+        def browse_path():
+            fmt = format_var.get()
+            if is_batch or fmt == "frames":
+                res = filedialog.askdirectory(parent=top, title="Select Output Folder")
+            else:
+                res = filedialog.asksaveasfilename(parent=top, title="Save Video As", defaultextension=".mp4", filetypes=[("MP4 Video", "*.mp4"), ("All Files", "*.*")])
+            if res:
+                path_var.set(res)
+                
+        tk.Button(path_frame, text="Browse...", command=browse_path).pack(side="right")
+        
+        # Frames Config Section
+        frames_label = tk.Label(top, text="3. Frames Extraction Configuration", font=("Arial", 10, "bold"))
+        frames_frame = tk.Frame(top)
+        
+        mode_frame = tk.Frame(frames_frame)
+        mode_frame.pack(pady=5)
+        
+        calc_label = tk.Label(frames_frame, text="", font=("Arial", 9), fg="#666666")
+        
+        def update_calc(*args):
+            try:
+                val = float(val_var.get())
+                if val <= 0: raise ValueError
+                if mode_var.get() == "fps":
+                    total_dur = total_frames / (master_fps or 25.0)
+                    count = max(1, int(total_dur * val))
+                elif mode_var.get() == "interval":
+                    total_dur = total_frames / (master_fps or 25.0)
+                    count = 1 + int(total_dur / val)
+                else:
+                    count = int(val)
+                calc_label.config(text=f"Will export {count} frames (Total available: {total_frames})")
+            except ValueError:
+                calc_label.config(text="Invalid input value")
+                
+        tk.Radiobutton(mode_frame, text="FPS", variable=mode_var, value="fps", command=update_calc).pack(side="left", padx=5)
+        tk.Radiobutton(mode_frame, text="Fixed Count", variable=mode_var, value="fixed", command=update_calc).pack(side="left", padx=5)
+        tk.Radiobutton(mode_frame, text="Interval (s)", variable=mode_var, value="interval", command=update_calc).pack(side="left", padx=5)
+        
+        entry = tk.Entry(frames_frame, textvariable=val_var, font=("Arial", 12), justify="center", width=10)
+        entry.pack(pady=10)
+        entry.bind("<KeyRelease>", update_calc)
+        
+        calc_label.pack(pady=5)
+        
+        def on_format_change(*args):
+            fmt = format_var.get()
+            if fmt == "frames":
+                frames_label.pack(anchor="w", padx=10, pady=(15, 5))
+                frames_frame.pack(fill="x", padx=20)
+                update_calc()
+            else:
+                frames_label.pack_forget()
+                frames_frame.pack_forget()
+            
+            # Clear path when format changes unless in batch mode
+            if not is_batch:
+                path_var.set("")
+                
+        tk.Radiobutton(fmt_frame, text="Video (MP4)", variable=format_var, value="video", command=on_format_change).pack(side="left", padx=10)
+        tk.Radiobutton(fmt_frame, text="Image Sequence", variable=format_var, value="frames", command=on_format_change).pack(side="left", padx=10)
+        
+        on_format_change()
+        
+        result = {}
+        def on_ok():
+            if not path_var.get():
+                messagebox.showerror("Error", "Please select an output destination.", parent=top)
+                return
+            
+            fmt = format_var.get()
+            if fmt == "frames":
+                try:
+                    val = float(val_var.get())
+                    if val <= 0: raise ValueError
+                    result["value"] = val
+                    result["mode"] = mode_var.get()
+                except ValueError:
+                    messagebox.showerror("Error", "Please enter a valid positive number for frames configuration.", parent=top)
+                    return
+            
+            result["format"] = fmt
+            result["path"] = path_var.get()
+            top.destroy()
+            
+        btn_frame = tk.Frame(top)
+        btn_frame.pack(side="bottom", pady=20)
+        tk.Button(btn_frame, text="Export", command=on_ok, width=15, bg="#4caf50", fg="white", font=("Arial", 10, "bold")).pack(side="left", padx=10)
+        tk.Button(btn_frame, text="Cancel", command=top.destroy, width=10).pack(side="left", padx=10)
+        
+        top.update_idletasks()
+        top.grab_set()
+        top.focus_force()
+        root.wait_window(top)
+        self._is_dialog_open = False
+        return result
+
     def _execute_export(self):
         if getattr(self, "_is_exporting", False) or getattr(self, "_is_dialog_open", False):
             return False
@@ -697,283 +928,203 @@ class Kut:
         total = self.get_total_frames()
         if total == 0: return False
         
-        def ask_radio(title, prompt, options):
-            self._is_dialog_open = True
-            import tkinter as tk
-            root = self._root()
-            top = tk.Toplevel(root)
-            top.title(title)
-            top.geometry("320x180")
-            
-            # CRITICAL FIX: Do NOT use top.transient(root) when root is withdrawn.
-            # Keep dialog topmost over OpenCV window and center it.
-            top.attributes("-topmost", True)
-            top.resizable(False, False)
-            
-            choice_var = tk.StringVar(value=options[0][1])
-            tk.Label(top, text=prompt, font=("Arial", 10)).pack(pady=10)
-            for text, val in options:
-                tk.Radiobutton(top, text=text, variable=choice_var, value=val, font=("Arial", 10)).pack(anchor="w", padx=50)
-                
-            result = [None]
-            def on_ok():
-                result[0] = choice_var.get()
-                top.destroy()
-                
-            btn_frame = tk.Frame(top)
-            btn_frame.pack(pady=15)
-            tk.Button(btn_frame, text="OK", command=on_ok, width=10).pack(side="left", padx=10)
-            tk.Button(btn_frame, text="Cancel", command=top.destroy, width=10).pack(side="left", padx=10)
-            
-            # CRITICAL FIX: Render UI before grabbing input events
-            top.update_idletasks()
-            top.grab_set()
-            top.focus_force()
-            
-            root.wait_window(top)
-            self._is_dialog_open = False
-            return result[0]
-
-        choice = ask_radio("Export", "Select export format:", [("Video (MP4)", "video"), ("Image Sequence (Frames)", "frames")])
-        if not choice: return False
+        cfg = self._show_unified_export_dialog("Export Project", total, self.master_fps, is_batch=False)
+        if not cfg: return False
         
         self._is_exporting = True
         try:
-            if choice == "video":
-                target = self._dialog_save()
-                if not target: return False
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(target, fourcc, self.master_fps, (self.master_w, self.master_h))
-                if not writer.isOpened():
-                    self._show_error("Could not create output file."); return False
-                written = 0
-                try:
-                    for clip in self.clips:
-                        for li in range(len(clip)):
-                            frame = clip.get_frame(li, high_quality=True, global_blur_strokes=self.global_blur_strokes)
-                            if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
-                                frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
-                            writer.write(frame)
-                            written += 1
-                            if written % 20 == 0 or written == total:
-                                self.status_msg = f"Exporting: {written}/{total}"
-                                self.render(); cv2.waitKey(1)
-                finally:
-                    writer.release()
-                self._add_recent_export(target)
-                self.status_msg = f"Export Completed: {total} frames"
+            is_busy = any(j.status in ("Exporting", "Queued") for j in self.active_exports)
+            
+            if cfg["format"] == "video":
+                job = ExportJob(
+                    job_type="video",
+                    target_path=cfg["path"],
+                    frames_to_export=total,
+                    fps=self.master_fps,
+                    dimensions=(self.master_w, self.master_h),
+                    clips=list(self.clips),
+                    global_blur_strokes=list(self.global_blur_strokes)
+                )
+                self.active_exports.append(job)
+                self.export_queue.put(job)
+                
+                status_word = "Queued" if is_busy else "Started"
+                self.status_msg = f"Export {status_word}: {os.path.basename(cfg['path'])}"
                 self.status_color = (0, 255, 0)
                 def clear_status():
                     self.status_msg = ""
                     self.status_color = None
+                import threading
                 threading.Timer(3.0, clear_status).start()
                 return True
                 
-            elif choice == "frames":
-                out_dir = filedialog.askdirectory(parent=self._root(), title="Select Output Folder")
-                if not out_dir: return False
-                
-                mode = ask_radio("Frames Export", "Select frame extraction mode:", [("Frames Per Second (FPS)", "fps"), ("Fixed Number of Frames", "fixed")])
-                if not mode: return False
+            elif cfg["format"] == "frames":
+                mode = cfg["mode"]
+                val = cfg["value"]
                 
                 if mode == "fps":
-                    val = simpledialog.askfloat("FPS", "Enter frames per second to extract:", parent=self._root(), initialvalue=1.0)
-                    if not val or val <= 0: return False
                     total_dur = total / (self.master_fps or 25.0)
                     val = max(1, int(total_dur * val))
                     frames_to_export = [int(i * (total - 1) / (val - 1)) for i in range(val)] if val > 1 else [0]
-                elif mode == "fixed":
-                    val = simpledialog.askinteger("Fixed", "Enter total number of frames to extract:", parent=self._root(), initialvalue=100)
-                    if not val or val <= 0: return False
+                elif mode == "interval":
+                    total_dur = total / (self.master_fps or 25.0)
+                    count = 1 + int(total_dur / val)
+                    frames_to_export = [int(i * (total - 1) / (count - 1)) for i in range(count)] if count > 1 else [0]
+                else: # fixed
+                    val = int(val)
                     frames_to_export = [int(i * (total - 1) / (val - 1)) for i in range(val)] if val > 1 else [0]
-                else:
-                    return False
                     
-                written = 0
-                for gf in frames_to_export:
-                    c_idx, c, l_idx = self._get_clip_at_frame(gf)
-                    if c:
-                        frame = c.get_frame(l_idx, high_quality=True, global_blur_strokes=self.global_blur_strokes)
-                        if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
-                            frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
-                        base_name = self._get_base_name()
-                        fname = os.path.join(out_dir, f"{base_name}_{written+1:03d}.jpg")
-                        cv2.imwrite(fname, frame)
-                    written += 1
-                    if written % 10 == 0 or written == len(frames_to_export):
-                        self.status_msg = f"Exporting Frames: {written}/{len(frames_to_export)}"
-                        self.render(); cv2.waitKey(1)
-                self._add_recent_export(out_dir)
-                self.status_msg = f"Export Completed: {len(frames_to_export)} frames"
+                job = ExportJob(
+                    job_type="frames",
+                    target_path=cfg["path"],
+                    frames_to_export=frames_to_export,
+                    fps=self.master_fps,
+                    dimensions=(self.master_w, self.master_h),
+                    clips=list(self.clips),
+                    global_blur_strokes=list(self.global_blur_strokes)
+                )
+                self.active_exports.append(job)
+                self.export_queue.put(job)
+                
+                status_word = "Queued" if is_busy else "Started"
+                self.status_msg = f"Export {status_word}: {len(frames_to_export)} frames"
                 self.status_color = (0, 255, 0)
                 def clear_status_frames():
                     self.status_msg = ""
                     self.status_color = None
+                import threading
                 threading.Timer(3.0, clear_status_frames).start()
                 return True
         finally:
             self._is_exporting = False
 
-    def _ask_radio(self, title, prompt, options):
-        self._is_dialog_open = True
-        import tkinter as tk
-        root = self._root()
-        top = tk.Toplevel(root)
-        top.title(title)
-        top.geometry("320x180")
-        top.attributes("-topmost", True)
-        top.resizable(False, False)
-        choice_var = tk.StringVar(value=options[0][1])
-        tk.Label(top, text=prompt, font=("Arial", 10)).pack(pady=10)
-        for text, val in options:
-            tk.Radiobutton(top, text=text, variable=choice_var, value=val, font=("Arial", 10)).pack(anchor="w", padx=50)
-        result = [None]
-        def on_ok():
-            result[0] = choice_var.get()
-            top.destroy()
-        btn_frame = tk.Frame(top)
-        btn_frame.pack(pady=15)
-        tk.Button(btn_frame, text="OK", command=on_ok, width=10).pack(side="left", padx=10)
-        tk.Button(btn_frame, text="Cancel", command=top.destroy, width=10).pack(side="left", padx=10)
-        top.update_idletasks()
-        top.grab_set()
-        top.focus_force()
-        root.wait_window(top)
-        self._is_dialog_open = False
-        return result[0]
-
     def _execute_export_single(self, clip):
         if getattr(self, "_is_exporting", False) or getattr(self, "_is_dialog_open", False): return False
-        choice = self._ask_radio("Export Single Track", "Select export format:", [("Video (MP4)", "video"), ("Image Sequence (Frames)", "frames")])
-        if not choice: return False
+        
+        total = len(clip)
+        if total == 0: return False
+        
+        cfg = self._show_unified_export_dialog(f"Export Single Track: {clip.label}", total, self.master_fps, is_batch=False)
+        if not cfg: return False
         
         self._is_exporting = True
         try:
-            if choice == "video":
-                target = self._dialog_save()
-                if not target: return False
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(target, fourcc, self.master_fps, (self.master_w, self.master_h))
-                if not writer.isOpened():
-                    self._show_error("Could not create output file."); return False
-                try:
-                    for li in range(len(clip)):
-                        frame = clip.get_frame(li, high_quality=True, global_blur_strokes=self.global_blur_strokes)
-                        if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
-                            frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
-                        writer.write(frame)
-                        if li % 20 == 0 or li == len(clip)-1:
-                            self.status_msg = f"Exporting: {li+1}/{len(clip)}"
-                            self.render(); cv2.waitKey(1)
-                finally:
-                    writer.release()
-                self._add_recent_export(target)
-                self._show_temp_status(f"Export Completed: {len(clip)} frames", (0, 255, 0))
-                return True
-            elif choice == "frames":
-                out_dir = filedialog.askdirectory(parent=self._root(), title="Select Output Folder")
-                if not out_dir: return False
-                mode = self._ask_radio("Frames Export", "Select frame extraction mode:", [("Frames Per Second (FPS)", "fps"), ("Fixed Number of Frames", "fixed")])
-                if not mode: return False
+            is_busy = any(j.status in ("Exporting", "Queued") for j in self.active_exports)
+            
+            if cfg["format"] == "video":
+                job = ExportJob(
+                    job_type="video",
+                    target_path=cfg["path"],
+                    frames_to_export=total,
+                    fps=self.master_fps,
+                    dimensions=(self.master_w, self.master_h),
+                    clips=[clip], # shallow copy of just this clip
+                    global_blur_strokes=list(self.global_blur_strokes)
+                )
+                self.active_exports.append(job)
+                self.export_queue.put(job)
                 
-                total = len(clip)
+                status_word = "Queued" if is_busy else "Started"
+                self._show_temp_status(f"Export {status_word}: {os.path.basename(cfg['path'])}", (0, 255, 0))
+                return True
+                
+            elif cfg["format"] == "frames":
+                mode = cfg["mode"]
+                val = cfg["value"]
+                
                 if mode == "fps":
-                    val = simpledialog.askfloat("FPS", "Enter frames per second to extract:", parent=self._root(), initialvalue=1.0)
-                    if not val or val <= 0: return False
                     total_dur = total / (self.master_fps or 25.0)
                     val = max(1, int(total_dur * val))
                     frames_to_export = [int(i * (total - 1) / (val - 1)) for i in range(val)] if val > 1 else [0]
-                elif mode == "fixed":
-                    val = simpledialog.askinteger("Fixed", "Enter total number of frames to extract:", parent=self._root(), initialvalue=100)
-                    if not val or val <= 0: return False
+                elif mode == "interval":
+                    total_dur = total / (self.master_fps or 25.0)
+                    count = 1 + int(total_dur / val)
+                    frames_to_export = [int(i * (total - 1) / (count - 1)) for i in range(count)] if count > 1 else [0]
+                else: # fixed
+                    val = int(val)
                     frames_to_export = [int(i * (total - 1) / (val - 1)) for i in range(val)] if val > 1 else [0]
                 
-                for i, li in enumerate(frames_to_export):
-                    frame = clip.get_frame(li, high_quality=True, global_blur_strokes=self.global_blur_strokes)
-                    if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
-                        frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
-                    base_name = "".join([c if c.isalnum() else "_" for c in clip.label])
-                    fname = os.path.join(out_dir, f"{base_name}_{i+1:03d}.jpg")
-                    cv2.imwrite(fname, frame)
-                    if i % 10 == 0 or i == len(frames_to_export)-1:
-                        self.status_msg = f"Exporting Frames: {i+1}/{len(frames_to_export)}"
-                        self.render(); cv2.waitKey(1)
-                self._add_recent_export(out_dir)
-                self._show_temp_status(f"Export Completed: {len(frames_to_export)} frames", (0, 255, 0))
+                job = ExportJob(
+                    job_type="frames",
+                    target_path=cfg["path"],
+                    frames_to_export=frames_to_export,
+                    fps=self.master_fps,
+                    dimensions=(self.master_w, self.master_h),
+                    clips=[clip],
+                    global_blur_strokes=list(self.global_blur_strokes)
+                )
+                self.active_exports.append(job)
+                self.export_queue.put(job)
+                
+                status_word = "Queued" if is_busy else "Started"
+                self._show_temp_status(f"Export {status_word}: {len(frames_to_export)} frames", (0, 255, 0))
                 return True
         finally:
             self._is_exporting = False
-            self._is_dialog_open = False
 
     def _execute_batch_export(self):
         if getattr(self, "_is_exporting", False) or getattr(self, "_is_dialog_open", False): return False
         clips = [self.clips[i] for i in sorted(self._selected_tracks)]
         if not clips: return False
         
-        self._is_dialog_open = True
-        try:
-            out_dir = filedialog.askdirectory(parent=self._root(), title="Select Output Folder for Selected Tracks")
-        finally:
-            self._is_dialog_open = False
-            
-        if not out_dir: return False
-        choice = self._ask_radio("Export Format", "Select format for tracks:", [("Video (MP4)", "video"), ("Image Sequence (Frames)", "frames")])
-        if not choice: return False
+        total_frames = sum(len(c) for c in clips)
+        cfg = self._show_unified_export_dialog(f"Batch Export ({len(clips)} tracks)", total_frames, self.master_fps, is_batch=True)
+        if not cfg: return False
         
-        mode, val = None, None
-        if choice == "frames":
-            mode = self._ask_radio("Frames Export", "Extraction mode:", [("FPS", "fps"), ("Fixed Number", "fixed")])
-            if not mode: return False
-            if mode == "fps":
-                val = simpledialog.askfloat("FPS", "Enter frames per second:", parent=self._root(), initialvalue=1.0)
-            else:
-                val = simpledialog.askinteger("Fixed", "Total frames per track:", parent=self._root(), initialvalue=100)
-            if not val or val <= 0: return False
-
+        out_dir = cfg["path"]
+        
         self._is_exporting = True
-        total_exported_frames = 0
         try:
+            is_busy = any(j.status in ("Exporting", "Queued") for j in self.active_exports)
             for c_idx, clip in enumerate(clips):
                 base_name = "".join([c if c.isalnum() else "_" for c in clip.label])
-                if choice == "video":
+                if cfg["format"] == "video":
                     target = os.path.join(out_dir, f"{base_name}_{c_idx+1}.mp4")
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    writer = cv2.VideoWriter(target, fourcc, self.master_fps, (self.master_w, self.master_h))
-                    if writer.isOpened():
-                        for li in range(len(clip)):
-                            frame = clip.get_frame(li, high_quality=True, global_blur_strokes=self.global_blur_strokes)
-                            if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
-                                frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
-                            writer.write(frame)
-                            if li % 20 == 0 or li == len(clip)-1:
-                                self.status_msg = f"Exporting {c_idx+1}/{len(clips)}: {li+1}/{len(clip)}"
-                                self.render(); cv2.waitKey(1)
-                        writer.release()
-                        self._add_recent_export(target)
-                        total_exported_frames += len(clip)
-                elif choice == "frames":
+                    job = ExportJob(
+                        job_type="video",
+                        target_path=target,
+                        frames_to_export=len(clip),
+                        fps=self.master_fps,
+                        dimensions=(self.master_w, self.master_h),
+                        clips=[clip],
+                        global_blur_strokes=list(self.global_blur_strokes)
+                    )
+                    self.active_exports.append(job)
+                    self.export_queue.put(job)
+                    
+                elif cfg["format"] == "frames":
                     total = len(clip)
+                    mode = cfg["mode"]
+                    val = cfg["value"]
+                    
                     if mode == "fps":
                         total_dur = total / (self.master_fps or 25.0)
                         batch_val = max(1, int(total_dur * val))
                         frames_to_export = [int(i * (total - 1) / (batch_val - 1)) for i in range(batch_val)] if batch_val > 1 else [0]
+                    elif mode == "interval":
+                        total_dur = total / (self.master_fps or 25.0)
+                        count = 1 + int(total_dur / val)
+                        frames_to_export = [int(i * (total - 1) / (count - 1)) for i in range(count)] if count > 1 else [0]
                     else:
+                        val = int(val)
                         frames_to_export = [int(i * (total - 1) / (val - 1)) for i in range(val)] if val > 1 else [0]
                     
                     clip_dir = os.path.join(out_dir, f"{base_name}_{c_idx+1}")
                     os.makedirs(clip_dir, exist_ok=True)
-                    for i, li in enumerate(frames_to_export):
-                        frame = clip.get_frame(li, high_quality=True, global_blur_strokes=self.global_blur_strokes)
-                        if (frame.shape[1], frame.shape[0]) != (self.master_w, self.master_h):
-                            frame = cv2.resize(frame, (self.master_w, self.master_h), interpolation=cv2.INTER_CUBIC)
-                        fname = os.path.join(clip_dir, f"frame_{i+1:03d}.jpg")
-                        cv2.imwrite(fname, frame)
-                        if i % 10 == 0 or i == len(frames_to_export)-1:
-                            self.status_msg = f"Exporting {c_idx+1}/{len(clips)}: {i+1}/{len(frames_to_export)}"
-                            self.render(); cv2.waitKey(1)
-                    self._add_recent_export(clip_dir)
-                    total_exported_frames += len(frames_to_export)
-            self._show_temp_status(f"Batch Export Completed: {total_exported_frames} frames", (0, 255, 0))
+                    job = ExportJob(
+                        job_type="frames",
+                        target_path=clip_dir,
+                        frames_to_export=frames_to_export,
+                        fps=self.master_fps,
+                        dimensions=(self.master_w, self.master_h),
+                        clips=[clip],
+                        global_blur_strokes=list(self.global_blur_strokes)
+                    )
+                    self.active_exports.append(job)
+                    self.export_queue.put(job)
+                    
+            status_word = "Queued" if is_busy else "Started"
+            self._show_temp_status(f"Batch Export {status_word}: {len(clips)} items", (0, 255, 0))
             return True
         finally:
             self._is_exporting = False
@@ -2023,7 +2174,19 @@ class Kut:
         is_open = getattr(self, "_show_downloads_panel", False)
         bg_col = Theme.ACCENT if is_open else (Theme.PANEL_ALT if hovered else Theme.PANEL)
         cv2.circle(canvas, (dl_cx, dl_cy), dl_r, bg_col, -1)
-        cv2.circle(canvas, (dl_cx, dl_cy), dl_r, Theme.BORDER_HI if hovered else Theme.BORDER, 1)
+        
+        active_list = [j for j in getattr(self, "active_exports", []) if j.status == "Exporting"]
+        if active_list:
+            total_prog = 0
+            for job in active_list:
+                if job.total_frames > 0:
+                    total_prog += job.processed_frames / job.total_frames
+            avg_prog = total_prog / len(active_list)
+            end_angle = -90 + int(avg_prog * 360)
+            cv2.circle(canvas, (dl_cx, dl_cy), dl_r, Theme.PANEL_ALT, 2)
+            cv2.ellipse(canvas, (dl_cx, dl_cy), (dl_r, dl_r), 0, -90, end_angle, Theme.ACCENT, 2)
+        else:
+            cv2.circle(canvas, (dl_cx, dl_cy), dl_r, Theme.BORDER_HI if hovered else Theme.BORDER, 1)
         
         arr_col = Theme.BG if is_open else (Theme.TEXT_BRIGHT if hovered else Theme.TEXT_DIM)
         cv2.line(canvas, (dl_cx, dl_cy - 4), (dl_cx, dl_cy + 4), arr_col, 2)
@@ -2049,51 +2212,126 @@ class Kut:
             self._dl_panel_hit_rects = []
             return
             
+        active_list = [j for j in self.active_exports if j.status in ("Queued", "Exporting")]
+        
+        display_items = []
+        for job in active_list:
+            display_items.append({"type": "job", "job": job})
+        for path in self.recent_exports:
+            display_items.append({"type": "path", "path": path})
+            
+        max_items = 2
+        
+        panel_w = 360
+        num_to_show = min(len(display_items), max_items)
+        if num_to_show == 0: num_to_show = 1
+        panel_h = 50 + num_to_show * 45
+        
         x1, y1, x2, y2 = self.layout["footer"]
-        panel_w = 340
-        panel_h = 50 + len(self.recent_exports) * 45 if self.recent_exports else 80
         px1 = x2 - panel_w - 10
         px2 = px1 + panel_w
         py2 = y1 - 10
         py1 = py2 - panel_h
+        self._dl_panel_rect = (px1, py1, px2, py2)
         
         # Panel background
         UI.rounded_rect(canvas, (px1, py1), (px2, py2), Theme.PANEL, radius=8, border_color=Theme.BORDER_HI, border_thick=1)
         
         # Title
-        UI.text(canvas, "Recent Exports", (px1 + 15, py1 + 25), 0.4, Theme.TEXT_BRIGHT, shadow=False)
+        UI.text(canvas, "Downloads & Exports", (px1 + 15, py1 + 25), 0.4, Theme.TEXT_BRIGHT, shadow=False)
         cv2.line(canvas, (px1 + 15, py1 + 35), (px2 - 15, py1 + 35), Theme.BORDER, 1)
         
         self._dl_panel_hit_rects = []
+        
+        if not display_items:
+            UI.text(canvas, "No exports yet.", (px1 + 15, py1 + 60), 0.35, Theme.TEXT_DIM, shadow=False)
+            return
+            
+        # Ensure scroll offset is valid
+        max_scroll = max(0, len(display_items) - max_items)
+        if getattr(self, "_dl_scroll_offset", 0) > max_scroll:
+            self._dl_scroll_offset = max_scroll
+        if getattr(self, "_dl_scroll_offset", 0) < 0:
+            self._dl_scroll_offset = 0
+            
+        offset = getattr(self, "_dl_scroll_offset", 0)
+        visible_items = display_items[offset:offset+max_items]
+        
         cy = py1 + 45
-        if not self.recent_exports:
-            UI.text(canvas, "No exports in this project yet.", (px1 + 15, cy + 15), 0.35, Theme.TEXT_DIM, shadow=False)
-        else:
-            for i, path in enumerate(self.recent_exports):
+        for i, item in enumerate(visible_items):
+            actual_idx = offset + i
+            if item["type"] == "job":
+                job = item["job"]
+                fname = os.path.basename(job.target_path)
+                if len(fname) > 22: fname = fname[:19] + "..."
+                UI.text(canvas, f"{fname}", (px1 + 15, cy + 12), 0.35, Theme.TEXT, shadow=False)
+                UI.text(canvas, f"({job.status})", (px1 + 15, cy + 26), 0.25, Theme.ACCENT, shadow=False)
+                
+                # Loader
+                if job.status in ("Exporting", "Queued"):
+                    lx = px2 - 25
+                    ly = cy + 11
+                    r = 12
+                    if job.status == "Exporting" and job.total_frames > 0:
+                        progress = job.processed_frames / job.total_frames
+                    else:
+                        progress = 0
+                    
+                    cv2.circle(canvas, (lx, ly), r, Theme.PANEL_ALT, 2)
+                    if progress > 0:
+                        end_angle = -90 + int(progress * 360)
+                        cv2.ellipse(canvas, (lx, ly), (r, r), 0, -90, end_angle, Theme.ACCENT, 2)
+                    
+                    cx_btn = lx
+                    cy_btn = ly
+                    hover_cancel = (getattr(self, "_hover_id", None) == f"dl_cancel_{actual_idx}")
+                    col_x = (0,0,255) if hover_cancel else Theme.TEXT_DIM
+                    sz = 4
+                    cv2.line(canvas, (cx_btn-sz, cy_btn-sz), (cx_btn+sz, cy_btn+sz), col_x, 2)
+                    cv2.line(canvas, (cx_btn-sz, cy_btn+sz), (cx_btn+sz, cy_btn-sz), col_x, 2)
+                    self._dl_panel_hit_rects.append(((cx_btn-12, cy_btn-12, cx_btn+12, cy_btn+12), "cancel", job, f"dl_cancel_{actual_idx}"))
+                    
+                    p_text = f"{job.processed_frames}/{job.total_frames}" if job.job_type == "frames" else f"{int(progress*100)}%"
+                    text_x = lx - 20 - int(UI.text_w(p_text, 0.25))
+                    UI.text(canvas, p_text, (text_x, ly + 4), 0.25, Theme.TEXT_DIM, shadow=False)
+                    
+            else:
+                path = item["path"]
                 fname = os.path.basename(path)
-                if len(fname) > 30: fname = fname[:27] + "..."
+                if len(fname) > 22: fname = fname[:19] + "..."
                 UI.text(canvas, fname, (px1 + 15, cy + 12), 0.35, Theme.TEXT, shadow=False)
                 
-                # Buttons
-                bx1_open = px2 - 145
+                bx1_open = px2 - 155
                 by1_btn = cy
                 bx2_open = bx1_open + 45
                 by2_btn = by1_btn + 22
                 
-                hover_open = (getattr(self, "_hover_id", None) == f"dl_open_{i}")
+                hover_open = (getattr(self, "_hover_id", None) == f"dl_open_{actual_idx}")
                 UI.rounded_rect(canvas, (bx1_open, by1_btn), (bx2_open, by2_btn), Theme.PANEL_ALT if hover_open else Theme.BG, radius=4, border_color=Theme.BORDER_HI if hover_open else Theme.BORDER)
                 UI.text(canvas, "Open", (bx1_open + 6, by2_btn - 6), 0.28, Theme.ACCENT if hover_open else Theme.TEXT_DIM, shadow=False)
                 
                 bx1_fold = bx2_open + 5
                 bx2_fold = bx1_fold + 85
-                hover_fold = (getattr(self, "_hover_id", None) == f"dl_folder_{i}")
+                hover_fold = (getattr(self, "_hover_id", None) == f"dl_folder_{actual_idx}")
                 UI.rounded_rect(canvas, (bx1_fold, by1_btn), (bx2_fold, by2_btn), Theme.PANEL_ALT if hover_fold else Theme.BG, radius=4, border_color=Theme.BORDER_HI if hover_fold else Theme.BORDER)
                 UI.text(canvas, "Location", (bx1_fold + 16, by2_btn - 6), 0.28, Theme.ACCENT if hover_fold else Theme.TEXT_DIM, shadow=False)
                 
-                self._dl_panel_hit_rects.append(((bx1_open, by1_btn, bx2_open, by2_btn), "open", path, f"dl_open_{i}"))
-                self._dl_panel_hit_rects.append(((bx1_fold, by1_btn, bx2_fold, by2_btn), "folder", path, f"dl_folder_{i}"))
+                self._dl_panel_hit_rects.append(((bx1_open, by1_btn, bx2_open, by2_btn), "open", path, f"dl_open_{actual_idx}"))
+                self._dl_panel_hit_rects.append(((bx1_fold, by1_btn, bx2_fold, by2_btn), "folder", path, f"dl_folder_{actual_idx}"))
                 
-                cy += 40
+            cy += 45
+            
+        if max_scroll > 0:
+            sb_x = px2 - 8
+            sb_y1 = py1 + 40
+            sb_y2 = py2 - 10
+            sb_h = sb_y2 - sb_y1
+            
+            thumb_h = max(20, int(sb_h * (max_items / len(display_items))))
+            thumb_y = sb_y1 + int((sb_h - thumb_h) * (offset / max_scroll))
+            
+            cv2.line(canvas, (sb_x, sb_y1), (sb_x, sb_y2), Theme.PANEL_ALT, 2)
+            cv2.line(canvas, (sb_x, thumb_y), (sb_x, thumb_y + thumb_h), Theme.BORDER_HI, 4)
 
     # ------------------------------------------------------------------
     # DRAW — Help overlay
@@ -2290,6 +2528,10 @@ class Kut:
                                 if os.path.isdir(val_norm): os.startfile(val_norm)
                                 else: os.startfile(os.path.dirname(val_norm))
                             except: pass
+                        elif action == "cancel":
+                            val.cancel_flag = True
+                            self._dl_dirty = True
+                            self.render()
                         return
                 
                 dx1, dy1, dx2, dy2 = getattr(self, "_downloads_btn_rect", (0,0,0,0))
@@ -2870,18 +3112,22 @@ class Kut:
                             # Zoom around mouse pointer
                             vw, vh = vx2 - vx1, vy2 - vy1
                             cx, cy = vx1 + vw // 2, vy1 + vh // 2
-                            dx = x - (cx + self._viewport_pan_x)
-                            dy = y - (cy + self._viewport_pan_y)
-                            ratio = self._viewport_zoom / old_zoom
-                            self._viewport_pan_x -= dx * (ratio - 1)
-                            self._viewport_pan_y -= dy * (ratio - 1)
-                        self._viewport_idx = None
-                    elif flags & cv2.EVENT_FLAG_SHIFTKEY:
-                        self._viewport_pan_x += -60 if up else 60
+                            dx, dy = x - cx, y - cy
+                            self._viewport_pan_x -= int(dx * (factor - 1) / old_zoom)
+                            self._viewport_pan_y -= int(dy * (factor - 1) / old_zoom)
+                            self._clamp_viewport_pan()
                         self._viewport_idx = None
                     else:
                         self._viewport_pan_y += -60 if up else 60
+                        self._clamp_viewport_pan()
                         self._viewport_idx = None
+                
+                # Check if mouse is in downloads panel
+                if getattr(self, "_show_downloads_panel", False) and hasattr(self, "_dl_panel_rect"):
+                    px1, py1, px2, py2 = self._dl_panel_rect
+                    if px1 <= x <= px2 and py1 <= y <= py2:
+                        self._dl_scroll_offset += -1 if up else 1
+                        self.render()
                 else:
                     rx1, ry1, rx2, ry2 = self.layout["right"]
                     if ry1 <= y <= ry2 and rx1 <= x <= rx2:
