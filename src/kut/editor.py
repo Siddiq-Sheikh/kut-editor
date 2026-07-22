@@ -22,9 +22,10 @@ from .media import VideoSource, Clip, _clip_id_counter, _clip_color_counter
 # MAIN EDITOR
 # ---------------------------------------------------------------------------
 class ExportJob:
-    def __init__(self, job_type, target_path, frames_to_export, fps, dimensions, clips, global_blur_strokes):
+    def __init__(self, job_type, target_path, frames_to_export, fps, dimensions, clips, global_blur_strokes, base_filename="export"):
         self.job_type = job_type  # 'video' or 'frames'
         self.target_path = target_path
+        self.base_filename = base_filename
         self.frames_to_export = frames_to_export  # List of frames to export (indices), or total frame count for video
         self.fps = fps
         self.dimensions = dimensions
@@ -549,7 +550,7 @@ class Kut:
 
     def _short_label(self, path):
         name = os.path.splitext(os.path.basename(path))[0]
-        return name[:16] + ("..." if len(name) > 16 else "")
+        return name
 
     def _open_video_from_path(self, path):
         """Load a video file and add to recent files."""
@@ -781,18 +782,17 @@ class Kut:
                     frame = cv2.resize(frame, job.dimensions, interpolation=cv2.INTER_CUBIC)
                 
                 # out_dir is target_path
-                base_name = os.path.basename(job.target_path) if not os.path.isdir(job.target_path) else "export"
+                base_name = job.base_filename
                 if os.path.isdir(job.target_path):
-                    fname = os.path.join(job.target_path, f"frame_{job.processed_frames+1:03d}.jpg")
+                    fname = os.path.join(job.target_path, f"{base_name}_{job.processed_frames+1:03d}.jpg")
                 else:
                     out_dir = os.path.dirname(job.target_path)
-                    name_no_ext = os.path.splitext(base_name)[0]
-                    fname = os.path.join(out_dir, f"{name_no_ext}_{job.processed_frames+1:03d}.jpg")
+                    fname = os.path.join(out_dir, f"{base_name}_{job.processed_frames+1:03d}.jpg")
                     
                 cv2.imwrite(fname, frame)
             job.processed_frames += 1
 
-    def _show_unified_export_dialog(self, title, total_frames, master_fps, is_batch=False):
+    def _show_unified_export_dialog(self, title, total_frames, master_fps, is_batch=False, initialfile=None):
         self._is_dialog_open = True
         import tkinter as tk
         from tkinter import filedialog, messagebox
@@ -828,7 +828,7 @@ class Kut:
             if is_batch or fmt == "frames":
                 res = filedialog.askdirectory(parent=top, title="Select Output Folder")
             else:
-                res = filedialog.asksaveasfilename(parent=top, title="Save Video As", defaultextension=".mp4", filetypes=[("MP4 Video", "*.mp4"), ("All Files", "*.*")])
+                res = filedialog.asksaveasfilename(parent=top, title="Save Video As", defaultextension=".mp4", initialfile=initialfile, filetypes=[("MP4 Video", "*.mp4"), ("All Files", "*.*")])
             if res:
                 path_var.set(res)
                 
@@ -928,7 +928,14 @@ class Kut:
         total = self.get_total_frames()
         if total == 0: return False
         
-        cfg = self._show_unified_export_dialog("Export Project", total, self.master_fps, is_batch=False)
+        base_filename = "export"
+        if self.clips:
+            try:
+                base_filename = os.path.splitext(os.path.basename(self.clips[0].source.path))[0]
+            except Exception:
+                pass
+
+        cfg = self._show_unified_export_dialog("Export Project", total, self.master_fps, is_batch=False, initialfile=base_filename)
         if not cfg: return False
         
         self._is_exporting = True
@@ -943,7 +950,8 @@ class Kut:
                     fps=self.master_fps,
                     dimensions=(self.master_w, self.master_h),
                     clips=list(self.clips),
-                    global_blur_strokes=list(self.global_blur_strokes)
+                    global_blur_strokes=list(self.global_blur_strokes),
+                    base_filename=base_filename
                 )
                 self.active_exports.append(job)
                 self.export_queue.put(job)
@@ -981,7 +989,8 @@ class Kut:
                     fps=self.master_fps,
                     dimensions=(self.master_w, self.master_h),
                     clips=list(self.clips),
-                    global_blur_strokes=list(self.global_blur_strokes)
+                    global_blur_strokes=list(self.global_blur_strokes),
+                    base_filename=base_filename
                 )
                 self.active_exports.append(job)
                 self.export_queue.put(job)
@@ -1004,7 +1013,11 @@ class Kut:
         total = len(clip)
         if total == 0: return False
         
-        cfg = self._show_unified_export_dialog(f"Export Single Track: {clip.label}", total, self.master_fps, is_batch=False)
+        base_filename = "".join([c if c.isalnum() or c in " _-." else "_" for c in clip.label]).strip()
+        if not base_filename:
+            base_filename = "track"
+
+        cfg = self._show_unified_export_dialog(f"Export Single Track: {clip.label}", total, self.master_fps, is_batch=False, initialfile=base_filename)
         if not cfg: return False
         
         self._is_exporting = True
@@ -1018,8 +1031,9 @@ class Kut:
                     frames_to_export=total,
                     fps=self.master_fps,
                     dimensions=(self.master_w, self.master_h),
-                    clips=[clip], # shallow copy of just this clip
-                    global_blur_strokes=list(self.global_blur_strokes)
+                    clips=[clip],
+                    global_blur_strokes=list(self.global_blur_strokes),
+                    base_filename=base_filename
                 )
                 self.active_exports.append(job)
                 self.export_queue.put(job)
@@ -1051,7 +1065,8 @@ class Kut:
                     fps=self.master_fps,
                     dimensions=(self.master_w, self.master_h),
                     clips=[clip],
-                    global_blur_strokes=list(self.global_blur_strokes)
+                    global_blur_strokes=list(self.global_blur_strokes),
+                    base_filename=base_filename
                 )
                 self.active_exports.append(job)
                 self.export_queue.put(job)
@@ -1077,9 +1092,12 @@ class Kut:
         try:
             is_busy = any(j.status in ("Exporting", "Queued") for j in self.active_exports)
             for c_idx, clip in enumerate(clips):
-                base_name = "".join([c if c.isalnum() else "_" for c in clip.label])
+                base_name = "".join([c if c.isalnum() or c in " _-." else "_" for c in clip.label]).strip()
+                if not base_name:
+                    base_name = f"track_{c_idx+1}"
+                    
                 if cfg["format"] == "video":
-                    target = os.path.join(out_dir, f"{base_name}_{c_idx+1}.mp4")
+                    target = os.path.join(out_dir, f"{base_name}.mp4")
                     job = ExportJob(
                         job_type="video",
                         target_path=target,
@@ -1087,7 +1105,8 @@ class Kut:
                         fps=self.master_fps,
                         dimensions=(self.master_w, self.master_h),
                         clips=[clip],
-                        global_blur_strokes=list(self.global_blur_strokes)
+                        global_blur_strokes=list(self.global_blur_strokes),
+                        base_filename=base_name
                     )
                     self.active_exports.append(job)
                     self.export_queue.put(job)
@@ -1109,7 +1128,7 @@ class Kut:
                         val = int(val)
                         frames_to_export = [int(i * (total - 1) / (val - 1)) for i in range(val)] if val > 1 else [0]
                     
-                    clip_dir = os.path.join(out_dir, f"{base_name}_{c_idx+1}")
+                    clip_dir = os.path.join(out_dir, base_name)
                     os.makedirs(clip_dir, exist_ok=True)
                     job = ExportJob(
                         job_type="frames",
@@ -1118,7 +1137,8 @@ class Kut:
                         fps=self.master_fps,
                         dimensions=(self.master_w, self.master_h),
                         clips=[clip],
-                        global_blur_strokes=list(self.global_blur_strokes)
+                        global_blur_strokes=list(self.global_blur_strokes),
+                        base_filename=base_name
                     )
                     self.active_exports.append(job)
                     self.export_queue.put(job)
